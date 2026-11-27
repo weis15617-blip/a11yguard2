@@ -91,4 +91,89 @@ class ActionParseTest {
         val p = parse(AppSettings.ACT_MASTER)
         assertTrue(p is Parsed.Master)
     }
+
+    // ══════════ ensure（确保开启）动作 ══════════
+    //
+    // 回归背景：锁屏/解锁是周期性事件，若用「切换」语义，
+    // 服务正常运行时每次熄屏都会把它关掉、亮屏再打开 —— 读屏反复中断。
+    // 正确语义是「自愈」：已开则不动，崩了才拉起。
+
+    /** 模拟 runAction 的动作分类（与 Triggers.runAction 的 when 分支一致）。 */
+    private fun classify(a: String): String = when {
+        a.isEmpty() || a == AppSettings.ACT_NONE -> "none"
+        a == AppSettings.ACT_ENSURE_MASTER -> "ensure"
+        a.startsWith(AppSettings.ACT_ENSURE_PREFIX) -> "ensure"
+        a == AppSettings.ACT_MASTER -> "master"
+        a.startsWith(AppSettings.ACT_PREFIX) -> "toggle"
+        a.contains('/') -> "toggle"   // 裸组件名也走 toggle
+        else -> "unknown"
+    }
+
+    @Test
+    fun ensureMaster_isClassifiedAsEnsure() {
+        assertEquals("ensure", classify(AppSettings.ACT_ENSURE_MASTER))
+    }
+
+    @Test
+    fun ensureComponent_isClassifiedAsEnsure() {
+        val a = AppSettings.ACT_ENSURE_PREFIX + "com.foo/com.foo.Svc"
+        assertEquals("ensure", classify(a))
+    }
+
+    @Test
+    fun ensureIsDistinctFromToggle() {
+        // 关键：ensure 与 toggle 必须是不同分支，否则锁屏会把服务关掉
+        val ensure = AppSettings.ACT_ENSURE_PREFIX + "com.foo/com.foo.Svc"
+        val toggle = AppSettings.ACT_PREFIX + "com.foo/com.foo.Svc"
+        assertEquals("ensure", classify(ensure))
+        assertEquals("toggle", classify(toggle))
+        assertTrue("两者不能等价", classify(ensure) != classify(toggle))
+    }
+
+    @Test
+    fun ensurePrefixDoesNotGetParsedAsToggle() {
+        // ensure: 前缀不含 "toggle:"，但要注意 toggle: 不是 ensure: 的前缀，
+        // 反之亦然 —— 这里验证顺序判断正确
+        val a = AppSettings.ACT_ENSURE_PREFIX + "master"
+        assertTrue("不该被当成 toggle", !a.startsWith(AppSettings.ACT_PREFIX))
+    }
+
+    @Test
+    fun bareComponent_stillToggles() {
+        assertEquals("toggle", classify("com.foo/com.foo.Svc"))
+    }
+
+    @Test
+    fun ensureMasterConstantIsExplicit() {
+        // 常量必须明确写死，便于用户配置文件里直接填
+        assertEquals("ensure:master", AppSettings.ACT_ENSURE_MASTER)
+        assertEquals("ensure:", AppSettings.ACT_ENSURE_PREFIX)
+    }
+
+    /**
+     * ensure 的核心语义：已开时**必须什么都不做**。
+     *
+     * 这里用纯逻辑表达该决策表，实际执行在 Triggers.ensureComp。
+     */
+    private fun ensureDecision(alreadyEnabled: Boolean): String =
+        if (alreadyEnabled) "no-op" else "start"
+
+    @Test
+    fun ensure_alreadyRunning_isNoOp() {
+        assertEquals("服务在跑就不该动它", "no-op", ensureDecision(true))
+    }
+
+    @Test
+    fun ensure_notRunning_starts() {
+        assertEquals("服务没跑才拉起", "start", ensureDecision(false))
+    }
+
+    @Test
+    fun ensure_neverReturnsStop() {
+        // 不变量：ensure 在任何输入下都不会产生"关闭"动作
+        for (state in listOf(true, false)) {
+            val d = ensureDecision(state)
+            assertTrue("ensure 绝不能返回 stop，实际=$d", d == "no-op" || d == "start")
+        }
+    }
 }

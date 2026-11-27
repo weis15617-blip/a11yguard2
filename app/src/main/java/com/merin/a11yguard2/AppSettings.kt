@@ -15,7 +15,29 @@ object AppSettings {
 
     const val ACT_NONE = "none"
     const val ACT_MASTER = "master"
+
+    /** 切换（取反）：开着就关、关着就开。 */
     const val ACT_PREFIX = "toggle:"
+
+    /**
+     * **确保开启**：已开则什么也不做；未开才打开。绝不关闭。
+     *
+     * ── 为什么需要这个动作 ──
+     *
+     * 锁屏/解锁这类"周期性触发"的场景，用「切换」是错的：
+     * 服务正常运行时，锁屏一次就把它关掉，解锁一次又打开 ——
+     * 用户会看到读屏反复中断。
+     *
+     * 正确的语义是**自愈**：屏幕状态变化时检查一次，
+     *   服务在跑 → 不动（用户可能正在听书）
+     *   服务崩了/被关了 → 拉起来
+     *
+     * 所以锁屏/解锁的推荐配置就是 `ensure:<component>`。
+     */
+    const val ACT_ENSURE_PREFIX = "ensure:"
+
+    /** 「确保开启」守护服务本身（最常用的组合）。 */
+    const val ACT_ENSURE_MASTER = "ensure:master"
 
 
     fun p(ctx: Context): SharedPreferences = SvcRepo.prefs(ctx)
@@ -67,6 +89,27 @@ object AppSettings {
 
     /** 摇一摇总开关；默认关闭，避免新用户被动开启传感器。 */
     fun shakeOn(ctx: Context): Boolean = p(ctx).getBoolean("shake_on", false)
+
+    /**
+     * 摇一摇「计次过程中」是否给弱震动反馈。
+     *
+     * ── 为什么需要 ──
+     *
+     * 摇动次数可以设到 10 次，过程中用户完全不知道摇到第几下：
+     *   · 给弱震动 → 每次计满一下就轻震一下，能数出来还差几次
+     *   · 不给     → 完全静默，只有成功时震一次（有人喜欢这样，安静）
+     *
+     * 所以做成开关，默认**开启**（多数人需要知道进度）。
+     * 强震动（触发成功）不受此开关影响，始终按「摇一摇震动」的时长执行。
+     */
+    fun shakeTickVibOn(ctx: Context): Boolean = p(ctx).getBoolean("shake_tick_vib", true)
+
+    /**
+     * 计次过程中的弱震动时长（毫秒）。默认 15ms（极轻）。
+     *
+     * 刻意做得很轻：如果和成功震动一样响，用户会分不清"累计中"和"已触发"。
+     */
+    fun shakeTickVibMs(ctx: Context): Int = p(ctx).getInt("shake_tick_vib_ms", 15)
 
     /** 摇一摇灵敏度档位 1-10（10 最灵敏）。 */
     fun shakeSensitivity(ctx: Context): Int =
@@ -220,9 +263,9 @@ object AppSettings {
 
     // ---------- 锁屏 / 解锁 ----------
 
-    fun lockAction(ctx: Context): String = p(ctx).getString("lock_action", ACT_NONE).orEmpty()
+    fun lockAction(ctx: Context): String = p(ctx).getString("lock_action", ACT_ENSURE_MASTER).orEmpty()
 
-    fun unlockAction(ctx: Context): String = p(ctx).getString("unlock_action", ACT_NONE).orEmpty()
+    fun unlockAction(ctx: Context): String = p(ctx).getString("unlock_action", ACT_ENSURE_MASTER).orEmpty()
 
     // ---------- 保活 ----------
 

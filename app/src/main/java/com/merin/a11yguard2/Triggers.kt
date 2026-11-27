@@ -58,6 +58,33 @@ object Triggers {
         return AppSettings.allowWhenLocked(ctx, kind)
     }
 
+    /**
+     * **确保某个无障碍服务处于开启状态**：已开则立即返回，未开才去打开。
+     *
+     * 与 [toggleComp] 的区别：toggle 会"取反"，ensure 只会"补上"。
+     * 锁屏/解锁这类周期性事件必须用 ensure —— 否则服务正常运行时
+     * 每次亮屏熄屏都会把它关掉又打开，读屏反复中断。
+     */
+    fun ensureComp(ctx: Context, comp: String, source: String) {
+        val target = SvcRepo.normalize(comp)
+        if (target.isEmpty()) {
+            Diag.log(source, "ensure skip: empty target")
+            return
+        }
+        if (SvcRepo.isEnabled(ctx, target)) {
+            // 已经在运行 —— 什么都不做（这是关键：不能关它）
+            Diag.log(source, "ensure ok（已在运行，不做变更）: $target")
+            return
+        }
+        Diag.log(source, "ensure 需要拉起: $target")
+        Thread {
+            val res = ToggleRouter.toggle(ctx, target, true)
+            AppSettings.bumpStat(ctx, res.ok)
+            Diag.log(source, "ensure ${res.logLine()}")
+            if (res.ok) vibrate(ctx, AppSettings.genVibMs(ctx))
+        }.start()
+    }
+
     /** 按“取反当前状态”的方式切换一个无障碍服务；在线程里走 Router，失败也有日志。 */
     fun toggleComp(ctx: Context, comp: String, source: String) {
         if (comp.isEmpty()) {
@@ -105,6 +132,21 @@ object Triggers {
             a == AppSettings.ACT_MASTER -> {
                 if (!SvcRepo.isEnabled(ctx, GuardA11yService.COMP)) {
                     toggleComp(ctx, GuardA11yService.COMP, source)
+                }
+            }
+
+            // 「确保开启」：已开则不动，未开才拉起来。绝不关闭。
+            a == AppSettings.ACT_ENSURE_MASTER ->
+                ensureComp(ctx, GuardA11yService.COMP, source)
+
+            a.startsWith(AppSettings.ACT_ENSURE_PREFIX) -> {
+                val target = a.removePrefix(AppSettings.ACT_ENSURE_PREFIX)
+                if (target == "master") {
+                    ensureComp(ctx, GuardA11yService.COMP, source)
+                } else if (target.contains('/')) {
+                    ensureComp(ctx, target, source)
+                } else {
+                    Diag.log(source, "unknown ensure target: $target")
                 }
             }
 

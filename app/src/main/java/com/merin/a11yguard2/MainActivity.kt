@@ -1066,8 +1066,52 @@ class MainActivity : AppCompatActivity() {
             }
             ll.addView(cardWrap(shakeLockSw))
             ll.addView(hint(
-                "摇一摇默认**锁屏时不响应** —— 手机放口袋里走路、放桌上震动都可能误触发。"
+                "摇一摇默认锁屏时不响应 —— 手机放口袋里走路、放桌上震动都可能误触发。"
             ))
+
+            // ── 两段式震动：过程弱震 + 成功强震 ──
+            ll.addView(sectionTitle("摇一摇震动反馈"))
+            val tickSw = MaterialSwitch(this).apply {
+                text = "摇动过程中给弱震动"
+                textSize = 14f
+                setTextColor(Color.parseColor(TEXT))
+                isChecked = AppSettings.shakeTickVibOn(this@MainActivity)
+                isFocusable = true
+                setOnCheckedChangeListener { _, v ->
+                    prefs.edit().putBoolean("shake_tick_vib", v).apply()
+                    Diag.log("setting", "shake_tick_vib=$v")
+                    TapAgentService.instance?.reloadShake()
+                    window.decorView.post { invalidateCurrentPage() }
+                }
+            }
+            ll.addView(cardWrap(tickSw))
+            ll.addView(hint(
+                "开启后：每累计满一次轻震一下（能数出还差几次），真正触发时按「摇一摇震动」的时长强震。"
+                    + "关闭则全程静默，只有成功时震一次。"
+            ))
+
+            if (AppSettings.shakeTickVibOn(this)) {
+                ll.addView(cardWrap(selectorRow(
+                    "过程弱震时长",
+                    "${AppSettings.shakeTickVibMs(this)} ms"
+                ) {
+                    pickOption(
+                        "摇动过程中的弱震动时长（尽量短，才能与成功震动区分）",
+                        listOf(
+                            "8" to "极短（8ms）",
+                            "12" to "很短（12ms）",
+                            "15" to "短（15ms，默认）",
+                            "25" to "中（25ms）",
+                            "40" to "较长（40ms）"
+                        ),
+                        AppSettings.shakeTickVibMs(this).toString()
+                    ) { v ->
+                        prefs.edit().putInt("shake_tick_vib_ms", v.toInt()).apply()
+                        TapAgentService.instance?.reloadShake()
+                        show(2)
+                    }
+                }))
+            }
 
             // 实时测试区
             ll.addView(sectionTitle("摇一摇 · 测试"))
@@ -1295,7 +1339,13 @@ class MainActivity : AppCompatActivity() {
                 show(2)
             }
         }))
-        ll.addView(hint("默认无动作，服务保持运行（锁屏听书不断）。"))
+        ll.addView(hint(
+            "推荐选「确保守护服务开启」：锁屏/解锁时只检查一次 —— "
+                + "服务在跑就不动（听书不中断），服务崩了或被关了才拉起来。"
+        ))
+        ll.addView(hint(
+            "不要选「切换」：那样每次亮屏熄屏都会把服务关掉又打开，读屏会反复中断。"
+        ))
         return ScrollView(this).apply { addView(ll) }
     }
 
@@ -1451,20 +1501,39 @@ class MainActivity : AppCompatActivity() {
 
     private fun actionLabel(a: String): String = when {
         a.isEmpty() || a == AppSettings.ACT_NONE -> "无动作"
+        a == AppSettings.ACT_ENSURE_MASTER -> "确保守护服务开启（崩了才拉起）"
+        a.startsWith(AppSettings.ACT_ENSURE_PREFIX) -> {
+            val t = a.removePrefix(AppSettings.ACT_ENSURE_PREFIX)
+            if (t == "master") "确保守护服务开启（崩了才拉起）"
+            else "确保开启：" + targetLabel(t)
+        }
         a == AppSettings.ACT_MASTER -> "打开守护服务（总开关）"
         a.startsWith(AppSettings.ACT_PREFIX) ->
             "切换：" + targetLabel(a.removePrefix(AppSettings.ACT_PREFIX))
         else -> a
     }
 
+    /**
+     * 选一个"锁屏/解锁时要做什么"。
+     *
+     * 选项顺序经过刻意安排：**「确保开启」排在最前**，因为它是
+     * 锁屏/解锁场景唯一正确的语义 —— 周期性事件必须做自愈，
+     * 不能做切换（否则服务正常时也会被反复关开）。
+     */
     private fun pickAction(title: String, current: String, onPick: (String) -> Unit) {
         val opts = mutableListOf(
             AppSettings.ACT_NONE to "无动作",
-            AppSettings.ACT_MASTER to "打开守护服务（总开关）",
-            // 语音助手：触发后说一句话来开关服务，说完自动释放麦克风。
-            // 适合读屏已经关掉、不方便摸屏幕的情况。
+            AppSettings.ACT_ENSURE_MASTER to "★ 确保守护服务开启（已开则不动，崩了才拉起）"
         )
-        SvcRepo.all(this).forEach { opts.add(AppSettings.ACT_PREFIX + it.comp to it.label) }
+        // 逐个服务的「确保开启」
+        SvcRepo.all(this).forEach {
+            opts.add(AppSettings.ACT_ENSURE_PREFIX + it.comp to "确保开启：${it.label}")
+        }
+        // 切换类放在后面，标注"不推荐用于锁屏"
+        opts.add(AppSettings.ACT_MASTER to "切换守护服务（不推荐用于锁屏）")
+        SvcRepo.all(this).forEach {
+            opts.add(AppSettings.ACT_PREFIX + it.comp to "切换：${it.label}（不推荐用于锁屏）")
+        }
         pickOption(title, opts, current, onPick)
     }
 

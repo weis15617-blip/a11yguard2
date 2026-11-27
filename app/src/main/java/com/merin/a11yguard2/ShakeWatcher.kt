@@ -47,6 +47,10 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
     private var registered = false
 
     private var vibMs = 35
+
+    /** 计次过程中的弱震动时长；0 = 不震。 */
+    private var tickVibMs = 0
+
     private var state = ShakeLogic.State()
 
     /** 当前生效的变化率阈值（由灵敏度档位算出）。 */
@@ -57,6 +61,8 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
 
     fun reload() {
         vibMs = AppSettings.sensorVibMs(ctx)
+        // 过程弱震动：开关关闭或总闸关闭时为 0（不震）
+        tickVibMs = if (AppSettings.shakeTickVibOn(ctx)) AppSettings.shakeTickVibMs(ctx) else 0
         val level = AppSettings.shakeSensitivity(ctx)
         forceThreshold = ShakeLogic.forceForSensitivity(level)
         needCount = AppSettings.shakeCount(ctx)
@@ -131,8 +137,13 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
                 Triggers.vibrate(ctx, vibMs, AppSettings.VIB_SHAKE)
                 onTrigger()
             }
-            r.verdict == ShakeLogic.Verdict.COUNTING ->
+            r.verdict == ShakeLogic.Verdict.COUNTING -> {
                 Diag.log("shake", "计数 %d/%d speed=%.0f".format(r.count, needCount, r.speed))
+                // 过程弱震：让用户能数出"还差几次"
+                if (tickVibMs > 0) {
+                    Triggers.vibrate(ctx, tickVibMs, AppSettings.VIB_SHAKE)
+                }
+            }
             r.verdict == ShakeLogic.Verdict.COOLDOWN ->
                 Diag.log("shake", "冷却中（上次触发 <${ShakeLogic.SHAKE_DURATION}ms）")
             else -> Unit

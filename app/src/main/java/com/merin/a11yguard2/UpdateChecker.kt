@@ -222,9 +222,9 @@ object UpdateChecker {
     fun candidateUrls(ownerRepo: String): List<Pair<String, Boolean>> {
         val raw = "https://raw.githubusercontent.com/$ownerRepo/main/update.json"
         return listOf(
-            // 1. ghproxy 镜像：**实时透传**，没有 CDN 缓存，发版后立即可见
-            "https://ghproxy.net/$raw" to false,
+            // 1. 镜像优先，且实测 gh-proxy 透传最及时（ghproxy 偶有延迟）
             "https://gh-proxy.com/$raw" to false,
+            "https://ghproxy.net/$raw" to false,
             // 2. GitHub API：实时、信息最全（带 Release 正文）
             "https://api.github.com/repos/$ownerRepo/releases/latest" to true,
             // 3. 直连 raw（海外用户命中这里）
