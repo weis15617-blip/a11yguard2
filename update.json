@@ -1,6 +1,6 @@
 {
-  "versionCode": 11300,
-  "versionName": "2.3.0",
-  "notes": "无障碍守护 2.3.0\n\n· 摇一摇两段式震动：累计中弱震、触发时强震（都可调/可关）\n· 锁屏/解锁改为「确保开启」：服务正常时不动，崩了才拉起\n· 修复：之前锁屏会把服务关掉、亮屏再打开，读屏反复中断\n· 默认配置即自愈，无需手动设置\n· 125 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v2.3.0/a11yguard2-2.3.0.apk"
+  "versionCode": 11500,
+  "versionName": "2.5.0",
+  "notes": "无障碍守护 2.5.0\n\n· 背面敲击加陀螺仪：区分「敲」和「推/碰」（参考 Google Columbus）\n· 摇一摇加比例判据：要求持续用力，碰撞/走路不再误触发（参考 Square Seismic）\n· 修复：内置更新无法安装（缺 REQUEST_INSTALL_PACKAGES）\n· 修复：摇一摇关闭时配置被隐藏，导致次数无法设定\n· 125 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v2.5.0/a11yguard2-2.5.0.apk"
 }
