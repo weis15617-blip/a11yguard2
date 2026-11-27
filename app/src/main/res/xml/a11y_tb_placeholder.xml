@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 照“无障碍联盟服务插件”的配置形态：只留 flags / feedbackType / notificationTimeout 指纹，
+     不声明 eventTypes、不声明 canRetrieveWindowContent、不声明触摸探索/按键过滤能力，
+     因此运行时既不接收事件，也拿不到窗口内容、碰不到触摸与按键。 -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityFeedbackType="feedbackAudible|feedbackHaptic|feedbackSpoken"
+    android:accessibilityFlags="flagDefault|flagRequestTouchExplorationMode|flagRequestEnhancedWebAccessibility|flagReportViewIds|flagRequestFilterKeyEvents|flagRetrieveInteractiveWindows"
+    android:description="@string/tb_placeholder_desc"
+    android:label="@string/tb_placeholder_label"
+    android:notificationTimeout="0" />

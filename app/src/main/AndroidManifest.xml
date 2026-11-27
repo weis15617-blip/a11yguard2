@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+      网络权限仅用于「检查更新」与下载新版 APK（设置页可完全关闭）。
+      除此之外应用不联网：不上传设备信息、不使用统计 SDK。
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 普通安装拿不到，需用户用一次 adb shell pm grant 授予；授权后随包持久化，重启仍有效 -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 背面敲击：仅在用户开启「熄屏继续检测」时用 PARTIAL_WAKE_LOCK 保持采样 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <queries>
+        <intent>
+            <action android:name="android.accessibilityservice.AccessibilityService" />
+        </intent>
+        <package android:name="moe.shizuku.privileged.api" />
+        <!-- 改包名的 Shizuku 管理端分支（如 Shevery），用于安装检测与拉起 -->
+        <package android:name="com.hamondev.shevery" />
+        <intent>
+            <action android:name="moe.shizuku.privileged.api.intent.action.REQUEST_AUTHORIZATION" />
+        </intent>
+        <intent>
+            <action android:name="moe.shizuku.manager.intent.action.REQUEST_AUTHORIZATION" />
+        </intent>
+        <!-- 这些包的无障碍服务未导出，intent 查询看不到；按包名补可见性（不使用 QUERY_ALL_PACKAGES） -->
+        <package android:name="com.androlua.shengjietxt" />
+        <package android:name="com.baidu.input_oppo" />
+        <package android:name="com.coloros.codebook" />
+        <package android:name="com.coloros.filemanager" />
+        <package android:name="com.heytap.quicksearchbox" />
+        <package android:name="com.iflytek.inputmethod" />
+        <package android:name="com.microsoft.appmanager" />
+        <package android:name="com.oplus.dmp" />
+        <package android:name="andes.oplus.documentsreader" />
+        <package android:name="li.songe.gkd" />
+        <!-- 只有声明可见性，本 App 才能准确判断真 TalkBack 是否已安装（用于跳过伪造组件串） -->
+        <package android:name="com.google.android.marvin.talkback" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Shizuku 必需：服务端通过该 provider 把 binder 递交给本应用；
+             缺了它 Shizuku.pingBinder() 永远为 false，界面会误报“Shizuku 未运行”。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false" />
+
+        <!-- 内置更新：把下载好的 APK 以 content:// 形式交给系统安装器读取。
+             自研实现（只暴露 .apk、只读、只在一个目录内），不引 androidx.core。 -->
+        <provider
+            android:name=".ApkFileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <service
+            android:name=".GuardA11yService"
+            android:exported="true"
+            android:label="@string/guard_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_guard" />
+        </service>
+
+        <service
+            android:name=".TapAgentService"
+            android:exported="true"
+            android:label="@string/tap_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_tap" />
+        </service>
+
+        <service
+            android:name="com.google.android.marvin.talkback.TalkBackService"
+            android:exported="true"
+            android:label="@string/tb_placeholder_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_tb_placeholder" />
+        </service>
+
+        <service
+            android:name=".GuardService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="accessibility_guard_keepalive" />
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

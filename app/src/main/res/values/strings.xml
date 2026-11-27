@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">无障碍守护</string>
+    <string name="guard_label">无障碍守护</string>
+    <string name="tap_label">无障碍守护·点按代理</string>
+    <string name="guard_desc">守护本机无障碍服务的开关状态，断开时自动尝试恢复。</string>
+    <string name="tap_desc">在系统无障碍设置页中代用户点击开关。仅在你手动授予无障碍权限后生效。</string>
+    <string name="tb_placeholder_label">TalkBack</string>
+    <string name="tb_placeholder_desc">无障碍守护的占位服务：不朗读、不接管触摸，仅让只检查“TalkBack 是否开启”的应用看到已开启信号。</string>
+</resources>
