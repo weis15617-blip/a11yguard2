@@ -118,54 +118,97 @@ object AppSettings {
         val sb = StringBuilder()
         val used = mutableSetOf<String>()
         var skipped = 0
-        var longNameCount = 0
 
         rows.forEach { row ->
-            // 名字：别名 > 清洗后的 label > 跳过
             val raw = aliasOf(ctx, row.comp, "").ifEmpty { row.label }
-            var name = cleanServiceName(raw)
-
-            // 英文名也要生成。
-            //
-            // 早期版本跳过了纯英文名，结果 TalkBack（Google 官方读屏）
-            // 被跳过 —— 而那恰恰是最主流的读屏，用户会说 "TalkBack"。
-            //
-            // 现在全都生成，只是对过长的英文串做截断（语音识别对短词更准）。
-            val hasChinese = name.any { it.code in 0x4E00..0x9FFF }
-            if (name.isEmpty()) {
+            if (raw.isEmpty()) {
                 skipped++
                 return@forEach
             }
-            if (!hasChinese && name.length > 10) {
-                // 长英文串（如 Colordirectservice）：截到 10 字符
-                name = name.take(10)
-                longNameCount++
+
+            // 每个服务生成多种名字变体，覆盖用户的真实说法。
+            //
+            // 实测问题：服务名叫「解说Max」，只生成「开启解说Max」时，
+            // 用户说「开启解说」完全匹配不到 —— 少了 "Max"。
+            //
+            // 变体策略：
+            //   1. 清洗后的全名（解说Max）
+            //   2. 去掉版本尾缀（解说）—— Max/Pro/Plus/HD/+/2 等
+            //   3. 去掉常见修饰前缀（解说）—— "无障碍"、"系统"
+            val full = cleanServiceName(raw)
+            if (full.isEmpty()) {
+                skipped++
+                return@forEach
             }
 
-            // 重名加序号
-            var finalName = name
-            if (used.contains(finalName)) {
-                var n = 2
-                while (used.contains("$finalName$n")) n++
-                finalName = "$finalName$n"
-            }
-            used.add(finalName)
+            val variants = LinkedHashSet<String>()
+            variants.add(full)
+            stripVersionSuffix(full)?.let { variants.add(it) }
+            stripCommonPrefix(full)?.let { variants.add(it) }
 
             val comp = SvcRepo.normalize(row.comp)
-            // 两种说法都生成：开启 / 打开
-            sb.append("开启").append(finalName).append('|').append("ensure:").append(comp).append('\n')
-            sb.append("打开").append(finalName).append('|').append("ensure:").append(comp).append('\n')
-            sb.append("关闭").append(finalName).append('|').append(comp).append('\n')
-            sb.append("关掉").append(finalName).append('|').append(comp).append('\n')
+
+            variants.forEach { variant ->
+                if (variant.isEmpty()) return@forEach
+                // 中文和英文都生成：TalkBack 这类英文用户会说
+                var name = variant
+                if (used.contains(name)) {
+                    var n = 2
+                    while (used.contains("$name$n")) n++
+                    name = "$name$n"
+                }
+                used.add(name)
+
+                // 四种说法全部用**幂等**语义：
+                //   开启/打开 → ensure:（只开不关）
+                //   关闭/关掉 → off:   （只关不开）
+                //
+                // 用切换语义（裸组件名）的后果：界面派发多次 → 切两次回到原位，
+                // 用户看到「关了又立刻开」。
+                sb.append("开启").append(name).append('|').append("ensure:").append(comp).append('\n')
+                sb.append("打开").append(name).append('|').append("ensure:").append(comp).append('\n')
+                sb.append("关闭").append(name).append('|').append("off:").append(comp).append('\n')
+                sb.append("关掉").append(name).append('|').append("off:").append(comp).append('\n')
+            }
         }
 
         if (skipped > 0) {
             Diag.log("voice", "跳过 $skipped 个无名称服务")
         }
-        if (longNameCount > 0) {
-            Diag.log("voice", "$longNameCount 个超长英文名已截断，可在设置页手动改成中文")
-        }
         return sb.toString().trimEnd()
+    }
+
+    /**
+     * 去掉版本尾缀，得到更短的名字。
+     *
+     * 「解说Max」→「解说」，「TalkBack 2」→「TalkBack」
+     * 用户口头上很少带版本号。
+     */
+    private fun stripVersionSuffix(s: String): String? {
+        val suffixes = listOf(
+            "Max", "MAX", "max", "Pro", "PRO", "pro",
+            "Plus", "PLUS", "plus", "HD", "Ultra", "Lite",
+            "+", "＋", " 2", " 3", "2", "3"
+        )
+        for (suf in suffixes) {
+            if (s.endsWith(suf) && s.length > suf.length + 1) {
+                val r = s.removeSuffix(suf).trim()
+                if (r.isNotEmpty() && r != s) return r
+            }
+        }
+        return null
+    }
+
+    /** 去掉常见修饰前缀（「无障碍守护」→「守护」）。 */
+    private fun stripCommonPrefix(s: String): String? {
+        val prefixes = listOf("无障碍", "系统")
+        for (pre in prefixes) {
+            if (s.startsWith(pre) && s.length > pre.length + 1) {
+                val r = s.removePrefix(pre).trim()
+                if (r.isNotEmpty() && r != s) return r
+            }
+        }
+        return null
     }
 
     /**
@@ -263,6 +306,21 @@ object AppSettings {
 
     /** 「确保开启」守护服务本身（最常用的组合）。 */
     const val ACT_ENSURE_MASTER = "ensure:master"
+
+    /**
+     * **确保关闭**前缀：已关则什么也不做；开着才关。绝不开启。
+     *
+     * ── 为什么需要（踩过的坑）──
+     *
+     * 「关闭X」原本用裸组件名（切换语义：开→关，关→开）。
+     * 但助手界面会把同一句话派发多次，导致 execute 跑两遍：
+     *   第1次：开→关 ✓
+     *   第2次：关→开 ✗（又开回来了）
+     * 用户看到的是「关了又立刻开」，或者以为完全没反应。
+     *
+     * 改成 ensure-disabled 之后，执行 N 次结果都是"关"，**幂等**。
+     */
+    const val ACT_OFF_PREFIX = "off:"
 
 
     fun p(ctx: Context): SharedPreferences = SvcRepo.prefs(ctx)

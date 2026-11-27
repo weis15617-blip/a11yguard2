@@ -93,10 +93,62 @@ class TapAgentProvider : ToggleProvider {
         return runCatching { svc.rootInActiveWindow }.getOrNull()
     }
 
+    /**
+     * 在无障碍设置页里找目标服务那一行。
+     *
+     * 三级降级，因为不同厂商的文案差异很大：
+     *   1. 精确匹配
+     *   2. 包含匹配
+     *   3. 去掉空格/标点后匹配（"解说 Max" vs "解说Max"）
+     *
+     * 全都不中时把页面上的候选行 dump 到日志 —— 用户反馈时能直接看出
+     * 这台手机实际显示的是什么，不用让他描述。
+     */
     private fun findByName(root: AccessibilityNodeInfo, label: String): AccessibilityNodeInfo? {
-        val exact = bfs(root) { it.text?.toString() == label }
-        return exact ?: bfs(root) { it.text?.toString()?.contains(label) == true }
+        // 1. 精确
+        bfs(root) { it.text?.toString()?.trim() == label }?.let { return it }
+
+        // 2. 包含
+        bfs(root) { it.text?.toString()?.trim()?.contains(label) == true }?.let { return it }
+
+        // 3. 归一化后比较（去空格、去标点、小写）
+        val normLabel = normalizeLabel(label)
+        if (normLabel.isNotEmpty()) {
+            bfs(root) { n ->
+                val t = normalizeLabel(n.text?.toString().orEmpty())
+                t.isNotEmpty() && (t == normLabel || t.contains(normLabel) || normLabel.contains(t))
+            }?.let { return it }
+        }
+
+        // 全不中：dump 候选行，便于诊断
+        runCatching {
+            val candidates = mutableListOf<String>()
+            val q = ArrayDeque<AccessibilityNodeInfo>()
+            q.add(root)
+            var n = 0
+            while (q.isNotEmpty() && n < 400) {
+                val node = q.removeFirst()
+                n++
+                val txt = node.text?.toString()?.trim().orEmpty()
+                // 无障碍设置页的服务行通常不是按钮，长度适中
+                if (txt.length in 2..40 && node.isClickable) candidates.add(txt)
+                for (i in 0 until runCatching { node.childCount }.getOrDefault(0)) {
+                    runCatching { node.getChild(i) }.getOrNull()?.let { q.add(it) }
+                }
+            }
+            Diag.log("tap", "未找到「$label」，页面可点文本：${candidates.take(20).joinToString(" / ")}")
+        }
+
+        return null
     }
+
+    /** 归一化：去空格、去常见标点、转小写。 */
+    private fun normalizeLabel(s: String): String =
+        s.replace(" ", "").replace("·", "").replace("—", "")
+            .replace("（", "(").replace("）", ")")
+            .replace("　", "")
+            .trim()
+            .lowercase()
 
     private fun findSwitch(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
         bfs(root) {
@@ -106,21 +158,106 @@ class TapAgentProvider : ToggleProvider {
             n.className?.toString()?.contains("Switch") == true || n.isCheckable
         }
 
+    /**
+     * 自动确认系统弹出的「无障碍权限」提示框。
+     *
+     * 典型弹窗：
+     *   检测到「无障碍守护」获取无障碍权限
+     *   无障碍权限允许应用查看屏幕内容并自动操作设备…
+     *   [关闭无障碍]        ← 危险按钮，绝不能点
+     *   [保持开启]          ← 要点这个
+     *
+     * ── 为什么之前点不到 ──
+     *
+     * 1. 文案不匹配：旧代码只找「允许/确定/好/Allow/OK」，
+     *    而这台手机显示的是「保持开启」，一个都不命中。
+     *
+     * 2. 只用 ACTION_CLICK：用户实测「带着读屏软件时点不了」。
+     *    读屏会拦截 ACTION_CLICK 到部分界面树，
+     *    必须用 dispatchGesture 注入真实触摸事件才能穿透。
+     */
     private fun confirmDialog(svc: TapAgentService) {
-        val okTexts = setOf("允许", "确定", "好", "Allow", "OK")
-        repeat(6) {
-            val r = runCatching { svc.rootInActiveWindow }.getOrNull() ?: return@repeat
-            val btn = bfs(r) { n ->
-                val t = n.text?.toString().orEmpty()
-                t in okTexts
+        // 「保持开启」及各种等价说法。注意「关闭无障碍」绝不在其中。
+        val okTexts = listOf(
+            "保持开启", "保持启用", "保持打开",
+            "保留", "继续", "启用", "开启",
+            "允许", "确定", "好", "同意",
+            "Allow", "OK", "Keep on", "Enable", "Continue"
+        )
+        // 危险文案：出现这些的节点绝不点击
+        val dangerTexts = listOf("关闭无障碍", "关闭", "停用", "禁用", "Turn off", "Disable")
+
+        repeat(10) {
+            val r = runCatching { svc.rootInActiveWindow }.getOrNull()
+            if (r == null) {
+                SystemClock.sleep(250)
+                return@repeat
             }
-            if (btn != null && clickNode(btn)) {
-                Diag.log("tap", "clicked confirm dialog")
-                SystemClock.sleep(300)
-                return
+
+            // 先找精确匹配的确认按钮
+            val target = okTexts.firstNotNullOfOrNull { txt ->
+                bfs(r) { n ->
+                    val t = n.text?.toString().orEmpty().trim()
+                    t == txt
+                }
+            } ?: okTexts.firstNotNullOfOrNull { txt ->
+                bfs(r) { n ->
+                    val t = n.text?.toString().orEmpty().trim()
+                    t.contains(txt) && dangerTexts.none { d -> t.contains(d) }
+                }
             }
-            SystemClock.sleep(300)
+
+            if (target != null) {
+                if (clickNodeSmart(svc, target)) {
+                    Diag.log("tap", "confirmed permission dialog（文案=${target.text}）")
+                    SystemClock.sleep(400)
+                    return
+                }
+            }
+            SystemClock.sleep(250)
         }
+        Diag.log("tap", "permission dialog 未出现或未能确认")
+    }
+
+    /**
+     * 三级点击降级。
+     *
+     * 1. ACTION_CLICK  —— 最快，对普通对话框有效
+     * 2. 父节点 CLICK   —— 很多对话框的真实可点节点是父容器
+     * 3. dispatchGesture 模拟点击 —— 绕过读屏对 ACTION_CLICK 的拦截
+     *
+     * 用户的实测结论："普通点击点击不了，搞个模拟点击就能点击过去"。
+     * 所以第 3 级是这台设备上的**实际生效路径**，不是可有可无的兜底。
+     */
+    private fun clickNodeSmart(svc: TapAgentService, node: AccessibilityNodeInfo): Boolean {
+        // 1. 直接 CLICK
+        if (runCatching { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) }
+                .getOrDefault(false)
+        ) return true
+
+        // 2. 向上找 5 层父节点
+        var p = node.parent
+        var depth = 0
+        while (p != null && depth < 5) {
+            val parent = p
+            if (runCatching { parent.performAction(AccessibilityNodeInfo.ACTION_CLICK) }
+                    .getOrDefault(false)
+            ) return true
+            p = parent.parent
+            depth++
+        }
+
+        // 3. 模拟点击（注入真实触摸事件）
+        val rect = android.graphics.Rect()
+        runCatching { node.getBoundsInScreen(rect) }
+        if (rect.width() > 0 && rect.height() > 0) {
+            val x = rect.centerX().toFloat()
+            val y = rect.centerY().toFloat()
+            val ok = svc.tapByGesture(x, y)
+            Diag.log("tap", "dispatchGesture @(${x.toInt()},${y.toInt()}) ok=$ok")
+            return ok
+        }
+        return false
     }
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {

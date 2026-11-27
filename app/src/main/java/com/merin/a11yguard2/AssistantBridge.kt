@@ -48,8 +48,14 @@ object AssistantBridge {
     /** 上次执行时刻（毫秒）。冷却期内完全不响应。 */
     private var lastFireAt = 0L
 
-    /** 上次执行的关键词，用于日志对照。 */
+    /** 上次执行的关键词，用于日志对照与去重。 */
     private var lastKeyword = ""
+
+    /** 上次执行同一关键词的时刻（毫秒），用于"同词只执行一次"。 */
+    private var lastSameKeywordAt = 0L
+
+    /** 同一关键词的最小执行间隔。界面刷新会多次派发同一事件。 */
+    private const val SAME_KEYWORD_GAP_MS = 1500L
 
     /** 上次处理的原始文本（诊断用）。 */
     private var lastText = ""
@@ -300,10 +306,22 @@ object AssistantBridge {
 
         // 取最长的那个（避免「解说」抢在「开启解说」之前）
         val keyword = fresh.maxByOrNull { it.length } ?: return false
+
+        // 同一关键词短时间内只执行一次。
+        //
+        // 即使只有一个无障碍服务处理事件，界面刷新仍可能把同一句话
+        // 派发多次（每次文字略有不同），导致 execute 两遍 →
+        // 开关切两次回到原位，用户体感是"没反应"。
+        if (keyword == lastKeyword && now - lastSameKeywordAt < SAME_KEYWORD_GAP_MS) {
+            Diag.log("assist", "同词冷却，忽略重复的「$keyword」")
+            return false
+        }
+
         val action = matchAction(raw, keyword) ?: return false
 
         lastFireAt = now
         lastKeyword = keyword
+        lastSameKeywordAt = now
         lastText = raw
         Diag.log("assist", "命中「$keyword」→ $action")
         onAction(keyword, action)
@@ -377,6 +395,7 @@ object AssistantBridge {
         currentPkg = ""
         lastEventAt = 0L
         baselineReady = false
+        lastSameKeywordAt = 0L
     }
 
         /** 由服务在 onCreate 时注入，用于读配置。 */

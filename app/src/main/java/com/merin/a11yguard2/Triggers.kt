@@ -143,6 +143,33 @@ object Triggers {
         }.start()
     }
 
+    /**
+     * **确保某个服务处于关闭状态**：已关则立即返回，开着才关。
+     *
+     * 与 [ensureComp] 对称，是「关闭X」的正确语义。
+     *
+     * 用切换语义（toggle）的问题是：界面把同一句话派发多次时，
+     * 会执行两遍 → 关掉又打开，用户看到「关了立刻又开」。
+     * ensure-disabled 执行多少次结果都是"关"。
+     */
+    fun ensureDisabled(ctx: Context, comp: String, source: String) {
+        val target = SvcRepo.normalize(comp)
+        if (target.isEmpty()) {
+            Diag.log(source, "off skip: empty target")
+            return
+        }
+        if (!SvcRepo.isEnabled(ctx, target)) {
+            Diag.log(source, "off ok（已关闭，不做变更）: $target")
+            return
+        }
+        Diag.log(source, "off 需要关闭: $target")
+        Thread {
+            val res = ToggleRouter.toggle(ctx, target, false)
+            AppSettings.bumpStat(ctx, res.ok)
+            Diag.log(source, "off ${res.logLine()}")
+        }.start()
+    }
+
     /** 按“取反当前状态”的方式切换一个无障碍服务；在线程里走 Router，失败也有日志。 */
     fun toggleComp(ctx: Context, comp: String, source: String) {
         if (comp.isEmpty()) {
@@ -190,6 +217,16 @@ object Triggers {
         }
 
         when {
+            // 确保关闭：已关则不动，开着才关。幂等。
+            a.startsWith(AppSettings.ACT_OFF_PREFIX) -> {
+                val target = a.removePrefix(AppSettings.ACT_OFF_PREFIX).trim()
+                if (target.contains('/')) {
+                    ensureDisabled(ctx, target, source)
+                } else {
+                    Diag.log(source, "unknown off target: $target")
+                }
+            }
+
 
             a.isEmpty() || a == AppSettings.ACT_NONE -> Unit
             a == AppSettings.ACT_MASTER -> {
