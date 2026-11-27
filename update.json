@@ -1,6 +1,6 @@
 {
-  "versionCode": 11500,
-  "versionName": "2.5.0",
-  "notes": "无障碍守护 2.5.0\n\n· 背面敲击加陀螺仪：区分「敲」和「推/碰」（参考 Google Columbus）\n· 摇一摇加比例判据：要求持续用力，碰撞/走路不再误触发（参考 Square Seismic）\n· 修复：内置更新无法安装（缺 REQUEST_INSTALL_PACKAGES）\n· 修复：摇一摇关闭时配置被隐藏，导致次数无法设定\n· 125 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v2.5.0/a11yguard2-2.5.0.apk"
+  "versionCode": 12000,
+  "versionName": "3.0.0",
+  "notes": "无障碍守护 3.0.0\n\n· 背面敲击改用 Google Columbus 原版算法（重采样+滤波+峰值检测+正负峰配对）\n· 摇一摇改用 Square Seismic 原版算法（模长平方+75%占比）\n· 新增语音控制：读系统助手界面文字，支持所有国产助手\n· 关键词自动生成（每个无障碍服务 4 种说法）\n· 震动五档折叠面板，时长与幅度分开控制\n· 修复 8 个 bug（页面跳顶/摇一摇不启动/计数卡住/更新无法安装等）\n· 反馈 QQ 群：1067815429",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.0.0/a11yguard2-3.0.0.apk"
 }
