@@ -1,6 +1,6 @@
 {
-  "versionCode": 12210,
-  "versionName": "3.2.1",
-  "notes": "无障碍守护 3.2.1\n\n· 修复：更新包另存一份到公共下载目录，用户能在文件管理器里找到\n· Android 10+ 走 MediaStore.Downloads（无需存储权限）\n· 下载完成 Toast 明确告知文件路径\n· 保留私有目录副本供系统安装器读取\n· 133 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.2.1/a11yguard2-3.2.1.apk"
+  "versionCode": 12300,
+  "versionName": "3.3.0",
+  "notes": "无障碍守护 3.3.0\n\n· 修复：关闭服务后立刻又开启（改用幂等 off: 语义）\n· 修复：说短名没反应（自动生成「解说」等短名变体）\n· 修复：权限弹窗「保持开启」点不掉（补 canPerformGestures + 模拟点击）\n· 跨机型：服务行三级匹配、找不到时 dump 候选、助手包名动态扫描\n· 危险按钮保护：绝不误点「关闭无障碍」\n· 133 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.3.0/a11yguard2-3.3.0.apk"
 }
