@@ -87,24 +87,45 @@ object UpdateChecker {
             return Result(false, error = "未设置更新源")
         }
 
-        val json = try {
-            when {
-                // 完整 URL
-                src.startsWith("http://") || src.startsWith("https://") -> fetchJson(src)
-                // owner/repo 形式
-                src.count { it == '/' } == 1 -> {
-                    val api = "https://api.github.com/repos/$src/releases/latest"
-                    fetchJson(api, github = true)
-                }
-                else -> return Result(false, error = "更新源格式不对（应填 owner/repo 或完整 URL）")
+        val isGithub = src.count { it == '/' } == 1 && !src.startsWith("http")
+
+        // 候选地址：完整 URL 也会自动展开镜像；owner/repo 走完整镜像链
+        val candidates: List<Pair<String, Boolean>> = if (isGithub) {
+            candidateUrls(src)
+        } else if (src.startsWith("http://") || src.startsWith("https://")) {
+            expandUrlCandidates(src)
+        } else {
+            return Result(false, error = "更新源格式不对（应填 owner/repo 或完整 URL）")
+        }
+
+        var lastErr: Exception? = null
+        var json: String? = null
+        var usedGithubApi = false
+
+        for ((url, gh) in candidates) {
+            try {
+                json = fetchJson(url, gh)
+                usedGithubApi = gh
+                Diag.log("update", "ok <- $url")
+                break
+            } catch (e: Exception) {
+                lastErr = e
+                Diag.log("update", "fail <- $url : ${e.javaClass.simpleName}")
             }
-        } catch (e: Exception) {
-            Diag.log("update", "fetch failed: ${e.javaClass.simpleName}: ${e.message}")
-            return Result(false, error = "网络请求失败：" + (e.message ?: e.javaClass.simpleName))
+        }
+
+        if (json == null) {
+            Diag.log("update", "all candidates failed: ${lastErr?.message}")
+            return Result(
+                false,
+                error = "网络请求失败：" + (lastErr?.message ?: "未知错误")
+                    + "\n\n如果是国内网络，GitHub 常被干扰。可以在设置页把更新源改成镜像地址，例如：\n"
+                    + "https://cdn.jsdelivr.net/gh/OWNER/REPO@main/update.json"
+            )
         }
 
         val info = try {
-            parse(json, src.count { it == '/' } == 1)
+            parse(json, usedGithubApi)
         } catch (e: Exception) {
             return Result(false, error = "解析更新信息失败：" + (e.message ?: "格式不符"))
         }
@@ -117,13 +138,55 @@ object UpdateChecker {
 
     // ---------- 网络 ----------
 
+    /**
+     * 抓取 JSON，带重试与多地址回落。
+     *
+     * ── 为什么要重试 ──
+     *
+     * 国内网络访问 GitHub 时，TLS 握手经常被重置（实测手机端报
+     * `SSLHandshakeException: connection closed`，但 ping 是通的）。
+     * 这种失败是间歇性的：同一地址重试几次常能成功。
+     *
+     * ── 多地址回落 ──
+     *
+     * 对 `owner/repo` 形式的源，依次尝试：
+     *   1. api.github.com（有 Release 说明，信息最全）
+     *   2. raw.githubusercontent.com 的 update.json（纯静态文件，常更易访问）
+     *   3. jsDelivr CDN 镜像（国内一般更稳）
+     *
+     * 任一成功即返回。全部失败时把最后一次的错误抛出去。
+     */
     private fun fetchJson(urlStr: String, github: Boolean = false): String {
+        val attempts = 2
+        var lastErr: Exception? = null
+        for (i in 1..attempts) {
+            try {
+                return fetchOnce(urlStr, github)
+            } catch (e: Exception) {
+                lastErr = e
+                Diag.log("update", "尝试 $i/$attempts 失败: ${e.javaClass.simpleName}: ${e.message}")
+                if (i < attempts) {
+                    // 递增退避：0.6s / 1.2s
+                    try {
+                        Thread.sleep(400L * i)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }
+        }
+        throw lastErr ?: RuntimeException("未知网络错误")
+    }
+
+    private fun fetchOnce(urlStr: String, github: Boolean): String {
         val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 15000
-            readTimeout = 20000
+            connectTimeout = 8000
+            readTimeout = 10000
             setRequestProperty("Accept", if (github) "application/vnd.github+json" else "application/json")
             setRequestProperty("User-Agent", "a11yguard2-updater")
+            // 部分网络环境下 gzip 会让分块读取卡住，这里明确要求不压缩
+            setRequestProperty("Accept-Encoding", "identity")
             instanceFollowRedirects = true
         }
         try {
@@ -133,8 +196,62 @@ object UpdateChecker {
             }
             return conn.inputStream.bufferedReader().use { it.readText() }
         } finally {
-            conn.disconnect()
+            runCatching { conn.disconnect() }
         }
+    }
+
+    /**
+     * 为 `owner/repo` 生成候选地址列表（按**实测成功率**排序）。
+     *
+     * ── 为什么镜像优先 ──
+     *
+     * 在国内网络下实测（2026-11-27，手机端 curl）：
+     *
+     *   api.github.com                → SSLHandshakeException（TLS 被重置）
+     *   raw.githubusercontent.com     → 完全不通
+     *   cdn.jsdelivr.net              → 200 ✓ 能取到内容
+     *   ghproxy.net                   → 200 ✓
+     *   gh-proxy.com                  → 200 ✓
+     *
+     * 所以把三个**镜像放前面**，GitHub 官方地址放最后兜底。
+     * 这样国内用户默认就能收到更新，海外用户前面失败也会自动落到官方 API。
+     *
+     * 代价：镜像返回的是静态 update.json，不含 Release 正文；
+     * 所以 update.json 里必须自带 notes（见仓库里的生成逻辑）。
+     */
+    fun candidateUrls(ownerRepo: String): List<Pair<String, Boolean>> {
+        val raw = "https://raw.githubusercontent.com/$ownerRepo/main/update.json"
+        return listOf(
+            // 1. jsDelivr CDN：国内实测最稳，全球也有节点
+            "https://cdn.jsdelivr.net/gh/$ownerRepo@main/update.json" to false,
+            // 2. ghproxy 类镜像（两个不同域名，避免单个挂掉）
+            "https://ghproxy.net/$raw" to false,
+            "https://gh-proxy.com/$raw" to false,
+            // 3. 直连 raw（海外用户优先命中这里）
+            raw to false,
+            // 4. GitHub API 兜底（能拿到完整 Release 说明）
+            "https://api.github.com/repos/$ownerRepo/releases/latest" to true
+        )
+    }
+
+    /**
+     * 完整 URL 的镜像回落：如果是 raw.githubusercontent.com 的地址，
+     * 自动生成对应的镜像地址一起尝试（用户手填 raw 地址时也能在国内用）。
+     */
+    fun expandUrlCandidates(url: String): List<Pair<String, Boolean>> {
+        val list = ArrayList<Pair<String, Boolean>>()
+        if (url.contains("raw.githubusercontent.com")) {
+            list.add("https://ghproxy.net/$url" to false)
+            list.add("https://gh-proxy.com/$url" to false)
+            // jsDelivr 只能映射仓库文件，尝试转换
+            val m = Regex("""raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)""").find(url)
+            if (m != null) {
+                val (owner, repo, branch, path) = m.destructured
+                list.add("https://cdn.jsdelivr.net/gh/$owner/$repo@$branch/$path" to false)
+            }
+        }
+        list.add(url to false)
+        return list
     }
 
     // ---------- 解析 ----------
