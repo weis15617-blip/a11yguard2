@@ -1009,6 +1009,30 @@ class MainActivity : AppCompatActivity() {
         if (!AppSettings.shakeOn(this)) {
             ll.addView(hint("摇一摇已关闭。打开后需要选一个目标服务。"))
         } else {
+            ll.addView(cardWrap(selectorRow(
+                "摇一摇灵敏度",
+                shakeSensitivityLabel()
+            ) {
+                pickOption(
+                    "灵敏度（1 = 最难触发，10 = 最灵敏）",
+                    (1..10).map { lv ->
+                        lv.toString() to "$lv / 10 · 阈值 %.0f".format(
+                            ShakeLogic.forceForSensitivity(lv)
+                        )
+                    },
+                    AppSettings.shakeSensitivity(this).toString()
+                ) { v ->
+                    prefs.edit().putInt("shake_sensitivity", v.toInt()).apply()
+                    Diag.log("setting", "shake_sensitivity=$v")
+                    TapAgentService.instance?.reloadShake()
+                    show(2)
+                }
+            }))
+            ll.addView(hint(
+                "如果手机放着不动也会触发，把灵敏度调低（数字小）。"
+                    + "如果甩得再用力也不响应，把灵敏度调高（数字大）。"
+            ))
+
             ll.addView(cardWrap(selectorRow("摇动次数", "摇 ${AppSettings.shakeCount(this)} 次触发") {
                 pickOption(
                     "摇动次数（1-10）",
@@ -1333,6 +1357,12 @@ class MainActivity : AppCompatActivity() {
             sb.append("\n置信度：%.2f".format(ev.confidence))
         }
         tv.text = sb.toString()
+    }
+
+    /** 摇一摇灵敏度的一行显示。 */
+    private fun shakeSensitivityLabel(): String {
+        val lv = AppSettings.shakeSensitivity(this)
+        return "$lv / 10 · 阈值 %.0f".format(ShakeLogic.forceForSensitivity(lv))
     }
 
     private fun backTapSensitivityLabel(): String {

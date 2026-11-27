@@ -250,13 +250,38 @@ class ShakeGestureTest {
     // ══════════ 常量守护 ══════════
 
     @Test
-    fun constantsMatchClassicImplementation() {
-        // 来自 Matthew Wiggins 2009 的实现，改动要谨慎
-        assertEquals(350f, ShakeLogic.FORCE_THRESHOLD, 0.01f)
+    fun constantsMatchModernTuning() {
+        // 时间相关常量沿用经典实现
         assertEquals(10L, ShakeLogic.TIME_THRESHOLD)
         assertEquals(500L, ShakeLogic.SHAKE_TIMEOUT)
         assertEquals(1000L, ShakeLogic.SHAKE_DURATION)
-        assertEquals(3, ShakeLogic.SHAKE_COUNT)
+        // 但阈值必须高于原版 350：现代设备精度高，350 会让「手机一动就触发」
+        assertTrue(
+            "默认阈值必须明显高于原版 350，否则过于灵敏",
+            ShakeLogic.DEFAULT_FORCE_THRESHOLD > 800f
+        )
+    }
+
+    @Test
+    fun sensitivityMapping_isMonotonic() {
+        val t1 = ShakeLogic.forceForSensitivity(1)
+        val t5 = ShakeLogic.forceForSensitivity(5)
+        val t10 = ShakeLogic.forceForSensitivity(10)
+        assertTrue("档位 1 最难触发（阈值最大）", t1 > t5)
+        assertTrue("档位 10 最灵敏（阈值最小）", t5 > t10)
+        assertTrue("最低档阈值应 >= 2500", t1 >= 2500f)
+        assertTrue("最高档阈值应 <= 500", t10 <= 500f)
+    }
+
+    @Test
+    fun sensitivity_clampsOutOfRange() {
+        assertEquals(ShakeLogic.forceForSensitivity(1), ShakeLogic.forceForSensitivity(0), 0.01f)
+        assertEquals(ShakeLogic.forceForSensitivity(10), ShakeLogic.forceForSensitivity(99), 0.01f)
+    }
+
+    @Test
+    fun sensitivity5_isDefault() {
+        assertEquals(5, ShakeLogic.DEFAULT_SENSITIVITY)
     }
 
     @Test

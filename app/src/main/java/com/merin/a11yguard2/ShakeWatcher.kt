@@ -49,10 +49,19 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
     private var vibMs = 35
     private var state = ShakeLogic.State()
 
+    /** 当前生效的变化率阈值（由灵敏度档位算出）。 */
+    private var forceThreshold = ShakeLogic.DEFAULT_FORCE_THRESHOLD
+
+    /** 当前生效的摇动次数。 */
+    private var needCount = ShakeLogic.SHAKE_COUNT
+
     fun reload() {
         vibMs = AppSettings.sensorVibMs(ctx)
+        val level = AppSettings.shakeSensitivity(ctx)
+        forceThreshold = ShakeLogic.forceForSensitivity(level)
+        needCount = AppSettings.shakeCount(ctx)
         resetCounts()
-        Diag.log("shake", "reload force=${ShakeLogic.FORCE_THRESHOLD} count=${ShakeLogic.SHAKE_COUNT}")
+        Diag.log("shake", "reload 灵敏度=$level 阈值=%.0f 次数=$needCount".format(forceThreshold))
     }
 
     fun start() {
@@ -99,16 +108,16 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
         val z = e.values[2]
         val now = SystemClock.elapsedRealtime()
 
-        val r = ShakeLogic.step(state, now, x, y, z)
+        val r = ShakeLogic.step(state, now, x, y, z, forceThreshold, needCount)
         state = r.state
 
         runCatching {
             testListener?.invoke(
                 Sample(
                     speed = r.speed,
-                    threshold = ShakeLogic.FORCE_THRESHOLD,
+                    threshold = forceThreshold,
                     count = r.count,
-                    need = ShakeLogic.SHAKE_COUNT,
+                    need = needCount,
                     verdict = r.verdict,
                     peakSpeed = state.peakSpeed,
                     triggered = r.triggered
@@ -123,7 +132,7 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
                 onTrigger()
             }
             r.verdict == ShakeLogic.Verdict.COUNTING ->
-                Diag.log("shake", "计数 %d/%d speed=%.0f".format(r.count, ShakeLogic.SHAKE_COUNT, r.speed))
+                Diag.log("shake", "计数 %d/%d speed=%.0f".format(r.count, needCount, r.speed))
             r.verdict == ShakeLogic.Verdict.COOLDOWN ->
                 Diag.log("shake", "冷却中（上次触发 <${ShakeLogic.SHAKE_DURATION}ms）")
             else -> Unit

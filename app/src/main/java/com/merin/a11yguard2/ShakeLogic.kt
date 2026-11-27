@@ -54,8 +54,38 @@ import kotlin.math.abs
  */
 object ShakeLogic {
 
-    /** 变化率阈值（原实现的 FORCE_THRESHOLD）。 */
-    const val FORCE_THRESHOLD = 350f
+    /**
+     * 默认变化率阈值。
+     *
+     * ⚠️ 原实现是 350，但那个值在现代设备上**过于灵敏**：
+     *   350 表示 20ms 内三轴和变化 0.7 m/s²，手机轻微一晃就够。
+     *   实测用户反馈"手机不能动，一动就触发"。
+     *
+     * 现代手机加速度计精度远高于 2009 年，且都带三轴融合，
+     * 同样的物理动作会产生更大的样本差值。所以默认提到 1200
+     * （约等于 20ms 内三轴和变化 2.4 m/s²），并开放灵敏度档位。
+     */
+    const val DEFAULT_FORCE_THRESHOLD = 1200f
+
+    /** 兼容旧命名。 */
+    const val FORCE_THRESHOLD = DEFAULT_FORCE_THRESHOLD
+
+    /**
+     * 灵敏度档位（1 = 最难触发 / 10 = 最灵敏）。
+     *
+     * 映射到 FORCE_THRESHOLD：
+     *   1  → 3000（要相当用力甩）
+     *   5  → 1600（默认，正常甩一下）
+     *   10 → 400 （很灵敏，轻微晃就触发）
+     */
+    fun forceForSensitivity(level: Int): Float {
+        val l = level.coerceIn(1, 10)
+        // 线性插值：level 1 → 3000, level 10 → 400
+        return 3000f - (l - 1) * (2600f / 9f)
+    }
+
+    /** 灵敏度档位对应的默认值（5 档）。 */
+    const val DEFAULT_SENSITIVITY = 5
 
     /**
      * 两次计算之间的最小间隔（毫秒）。
@@ -142,7 +172,9 @@ object ShakeLogic {
         now: Long,
         x: Float,
         y: Float,
-        z: Float
+        z: Float,
+        forceThreshold: Float = DEFAULT_FORCE_THRESHOLD,
+        needCount: Int = SHAKE_COUNT
     ): Step {
         // 超时清零：太久没有动作，之前的累计作废
         var shakeCount = st.shakeCount
@@ -179,10 +211,10 @@ object ShakeLogic {
         var triggered = false
         var verdict: Verdict
 
-        if (speed > FORCE_THRESHOLD) {
+        if (speed > forceThreshold) {
             shakeCount++
             lastForce = now
-            if (shakeCount >= SHAKE_COUNT) {
+            if (shakeCount >= needCount.coerceAtLeast(1)) {
                 if (now - lastShake > SHAKE_DURATION) {
                     lastShake = now
                     shakeCount = 0

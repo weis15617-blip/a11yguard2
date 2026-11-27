@@ -68,6 +68,10 @@ object AppSettings {
     /** 摇一摇总开关；默认关闭，避免新用户被动开启传感器。 */
     fun shakeOn(ctx: Context): Boolean = p(ctx).getBoolean("shake_on", false)
 
+    /** 摇一摇灵敏度档位 1-10（10 最灵敏）。 */
+    fun shakeSensitivity(ctx: Context): Int =
+        p(ctx).getInt("shake_sensitivity", ShakeLogic.DEFAULT_SENSITIVITY).coerceIn(1, 10)
+
     /** 摇动次数：摇几下触发（1-10）。 */
     fun shakeCount(ctx: Context): Int =
         p(ctx).getInt("shake_count_free", 3).coerceIn(1, 10)

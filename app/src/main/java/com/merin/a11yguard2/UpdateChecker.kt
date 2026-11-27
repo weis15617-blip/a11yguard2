@@ -222,15 +222,17 @@ object UpdateChecker {
     fun candidateUrls(ownerRepo: String): List<Pair<String, Boolean>> {
         val raw = "https://raw.githubusercontent.com/$ownerRepo/main/update.json"
         return listOf(
-            // 1. jsDelivr CDN：国内实测最稳，全球也有节点
-            "https://cdn.jsdelivr.net/gh/$ownerRepo@main/update.json" to false,
-            // 2. ghproxy 类镜像（两个不同域名，避免单个挂掉）
+            // 1. ghproxy 镜像：**实时透传**，没有 CDN 缓存，发版后立即可见
             "https://ghproxy.net/$raw" to false,
             "https://gh-proxy.com/$raw" to false,
-            // 3. 直连 raw（海外用户优先命中这里）
+            // 2. GitHub API：实时、信息最全（带 Release 正文）
+            "https://api.github.com/repos/$ownerRepo/releases/latest" to true,
+            // 3. 直连 raw（海外用户命中这里）
             raw to false,
-            // 4. GitHub API 兜底（能拿到完整 Release 说明）
-            "https://api.github.com/repos/$ownerRepo/releases/latest" to true
+            // 4. jsDelivr 兜底放最后：
+            //    它缓存 12 小时，发版后可能仍返回旧版本 ——
+            //    曾导致"刚发 2.1.0 但应用提示已是最新"。所以只当最后手段。
+            "https://cdn.jsdelivr.net/gh/$ownerRepo@main/update.json" to false
         )
     }
 
