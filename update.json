@@ -1,0 +1,6 @@
+{
+  "versionCode": 10800,
+  "versionName": "1.8.0",
+  "notes": "无障碍守护 1.8.0\n\n· 新增内置更新：启动自动检查新版本\n· 新增 root 执行方式：不需要 adb / Shizuku\n· 修复界面只有左侧 1/3 可触摸\n· 修复关掉开关后仍在工作（背面敲击 / 音量键）\n· 移除摇一摇（4 种判据均失败）\n\n完整说明见 Release 页面。",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v1.8.0/a11yguard2-1.8.0.apk"
+}
