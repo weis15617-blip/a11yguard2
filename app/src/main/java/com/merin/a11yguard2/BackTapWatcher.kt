@@ -56,6 +56,9 @@ class BackTapWatcher(
 
     private var vibMs = 35
 
+    /** 诊断：距离上次打日志累计的采样数。 */
+    private var debugSamples = 0
+
     fun reload() {
         val sp = AppSettings
         val params = BackTapLogic.paramsForSensitivity(sp.backTapSensitivity(ctx))
@@ -68,8 +71,8 @@ class BackTapWatcher(
         if (changed) applyRegistration()
         Diag.log(
             "backtap",
-            "reload lv=${sp.backTapSensitivity(ctx)} th=%.2f gap=%d conf=%.2f need=%d off=%s"
-                .format(params.ampThreshold, params.maxGapMs, params.minConfidence, sp.backTapCount(ctx), allow)
+            "reload lv=${sp.backTapSensitivity(ctx)} noise=%.3f win=%d need=%d off=%s"
+                .format(params.minNoise, params.peakWindow, sp.backTapCount(ctx), allow)
         )
     }
 
@@ -178,7 +181,7 @@ class BackTapWatcher(
             sm?.registerListener(this, g, periodUs) ?: false
         }.getOrDefault(false)
         detector.setGyroAvailable(gyroRegistered)
-        Diag.log("backtap", "陀螺仪 registered=$gyroRegistered 否决阈值=${BackTapLogic.GYRO_VETO}")
+        Diag.log("backtap", "陀螺仪 registered=$gyroRegistered（Columbus 算法不需要它，仅诊断）")
     }
 
     private fun unregister() {
@@ -224,7 +227,7 @@ class BackTapWatcher(
         flushTask?.let { flushHandler.removeCallbacks(it) }
         val r = object : Runnable {
             override fun run() {
-                val ev = detector.flush(SystemClock.elapsedRealtime())
+                val ev = detector.flush(System.nanoTime())
                 if (ev != null) {
                     Diag.log(
                         "backtap",
@@ -240,10 +243,13 @@ class BackTapWatcher(
         flushHandler.postDelayed(r, (lengthGapMs() + 120).toLong())
     }
 
-    /** 当前灵敏度下允许的最大敲击间隔（毫秒）。 */
-    private fun lengthGapMs(): Int = runCatching {
-        BackTapLogic.paramsForSensitivity(AppSettings.backTapSensitivity(ctx)).maxGapMs
-    }.getOrDefault(300)
+    /**
+     * 等待第 3 下的时长（毫秒）。
+     *
+     * 原版双击上限 500ms。用户敲完第 2 下后，要等这么久才能确定
+     * 「是不是还要敲第 3 下」。取 500ms 是 Google 的实测值。
+     */
+    private fun lengthGapMs(): Int = (BackTapLogic.MAX_TAP_GAP_NS / 1_000_000L).toInt()
 
     override fun onSensorChanged(event: SensorEvent?) {
         val e = event ?: return
@@ -256,11 +262,42 @@ class BackTapWatcher(
         }
         if (e.sensor.type != Sensor.TYPE_ACCELEROMETER) return
 
-        val deviation = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - BackTapLogic.GRAVITY
-        val ev = detector.feed(SystemClock.elapsedRealtime(), deviation, lastGyroMag) ?: return
+        // 新版检测器沿用 Google Columbus 的完整信号处理管线：
+        //   重采样 → 求斜率 → 低通 → 高通(去重力) → 峰值检测 → 正负峰配对判据
+        // 所以必须传**原始三轴值**和**纳秒时间戳**，不能只传模长偏离。
+        // 只给模长的话，滤波器拿不到方向信息，重力也去不掉。
+        val ev = detector.feed(e.timestamp, v[0], v[1], v[2], lastGyroMag)
+
+        // 诊断：每 500 个采样打一次内部状态。
+        // 没有这个的话，"没反应"时完全无法判断是算法没识别、还是识别了但目标为空。
+        debugSamples++
+        if (debugSamples >= 500) {
+            debugSamples = 0
+            Diag.log(
+                "backtap",
+                "采样=${detector.totalSamples} 敲击=${detector.totalTaps} " +
+                    "区间=${detector.peakInRange} 配对=${detector.pairedCount} " +
+                    "信号[maxZ=%.2f maxSlope=%.2f maxHp=%.4f 门限=%.3f]"
+                        .format(
+                            detector.maxZDev, detector.maxSlope,
+                            detector.maxHpKey,
+                            AppSettings.backTapSensitivity(ctx).let {
+                                BackTapLogic.paramsForSensitivity(it).minNoise
+                            }
+                        )
+            )
+        }
+        if (ev == null) return
         onEvent(ev)
-        if (ev.accepted && !ev.triggered && vibMs > 0) {
-            Triggers.vibrate(ctx, vibMs, AppSettings.VIB_TAP)
+        // 计数中的反馈：固定用羽毛级（TICK_AMPLITUDE），不用用户的档位。
+        // 否则每计一次数都很重，整个敲击过程都在被强震打断。
+        if (ev.accepted && !ev.triggered) {
+            Triggers.vibrate(
+                ctx,
+                AppSettings.TICK_MS,
+                AppSettings.VIB_TAP,
+                AppSettings.TICK_AMPLITUDE
+            )
         }
         if (ev.triggered) {
             Diag.log(
@@ -268,6 +305,16 @@ class BackTapWatcher(
                 "triggered taps=${ev.taps} need=${ev.need} peak=%.2f conf=%.2f"
                     .format(ev.peak, ev.confidence)
             )
+            // 触发成功：**在这里震一次，且只震一次**。
+            // 执行层（Triggers）已改成静默，避免"咚咚两下"。
+            if (AppSettings.vibOnSuccess(ctx)) {
+                Triggers.vibrate(
+                    ctx,
+                    AppSettings.vibMs(ctx, AppSettings.VIB_TAP, 14),
+                    AppSettings.VIB_TAP,
+                    AppSettings.vibAmp(ctx, AppSettings.VIB_TAP)
+                )
+            }
             onTrigger(ev)
             return
         }

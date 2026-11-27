@@ -92,8 +92,9 @@ object BackTapRuntime {
         val c = ctxRef ?: return
         val target = AppSettings.backTapTarget(c)
         if (target.isEmpty()) {
+            // 不再震动：震动职责已经完全交给 BackTapWatcher，
+            // 这里再震会与它的震动叠加，听感是一次短震 + 一声长嗡（像两次）。
             Diag.log("backtap", "trigger but target empty（设置里未选择目标服务）")
-            Triggers.vibrate(c, 160, AppSettings.VIB_TAP)
             return
         }
         Diag.log("backtap", "trigger → ${SvcRepo.normalize(target)}")
@@ -121,8 +122,8 @@ object BackTapRuntime {
             else -> ""
         }
         if (target.isEmpty()) {
+            // 同上：不震，避免与 Watcher 的震动叠加
             Diag.log("backtap", "trigger but no target（设置里未选择目标服务）")
-            Triggers.vibrate(c, 160, AppSettings.VIB_TAP)
             return
         }
         val kind = if (ev.taps >= 3) "三击" else "双击"

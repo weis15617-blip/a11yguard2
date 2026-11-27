@@ -172,9 +172,17 @@ class TapAgentService : AccessibilityService() {
             .putBoolean("tap_ever_on", true)
             .putBoolean("tap_desired_on", true)
             .apply()
+        // 助手桥接需要 context 读配置
+        AssistantBridge.appContext = applicationContext
+
         resetGestureCounters()
         BackTapRuntime.acquire(this, BackTapRuntime.OWNER_TAPAGENT)
         registerScreenReceiver()
+        // 启动摇一摇监听。
+        // 早期这里漏了这行 —— startShake() 只在 reloadShake() 里被调，
+        // 而 reloadShake 只有用户去设置页改摇一摇参数时才触发。
+        // 结果：开机后摇一摇完全不工作，除非手动开关一次。
+        startShake()
     }
 
     /** 设置页改动摇一摇参数后调用。 */
@@ -410,7 +418,32 @@ class TapAgentService : AccessibilityService() {
     private fun sameComp(target: String): Boolean =
         SvcRepo.normalize(target) == SvcRepo.normalize(COMP)
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // ── 助手界面触发 ──
+        //
+        // Android 不允许第三方拿助手的语音识别结果（安全边界）。
+        // 但助手必须把结果显示给用户看，无障碍服务能读到界面上出现的文字。
+        // 于是：用户对助手说「关闭解说」→ 助手显示文字 → 本服务读到 → 执行。
+        //
+        // 只在配置的助手包名里生效，否则全网文字都会被扫，误触发且耗电。
+        if (event == null) return
+        AssistantBridge.appContext = applicationContext
+        AssistantBridge.onEvent(
+            event,
+            AppSettings.assistantBridgeOn(this),
+            AppSettings.assistantPkgs(this),
+            windowText = {
+                // 兜底：事件文字没命中时，读整个活动窗口的文字。
+                // 助手把识别结果显示在对话框/列表项里时，event.text 是空的。
+                runCatching {
+                    AssistantBridge.collectText(rootInActiveWindow)
+                }.getOrDefault("")
+            }
+        ) { keyword, action ->
+            Diag.log("assist", "命中「$keyword」→ $action")
+            Triggers.runAction(this, action, "assist")
+        }
+    }
 
     override fun onInterrupt() {
         resetGestureCounters()
@@ -456,7 +489,32 @@ class GuardA11yService : AccessibilityService() {
         if (SvcRepo.prefs(this).getBoolean("desired_on", false)) Keepalive.start(this)
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // ── 助手界面触发 ──
+        //
+        // Android 不允许第三方拿助手的语音识别结果（安全边界）。
+        // 但助手必须把结果显示给用户看，无障碍服务能读到界面上出现的文字。
+        // 于是：用户对助手说「关闭解说」→ 助手显示文字 → 本服务读到 → 执行。
+        //
+        // 只在配置的助手包名里生效，否则全网文字都会被扫，误触发且耗电。
+        if (event == null) return
+        AssistantBridge.appContext = applicationContext
+        AssistantBridge.onEvent(
+            event,
+            AppSettings.assistantBridgeOn(this),
+            AppSettings.assistantPkgs(this),
+            windowText = {
+                // 兜底：事件文字没命中时，读整个活动窗口的文字。
+                // 助手把识别结果显示在对话框/列表项里时，event.text 是空的。
+                runCatching {
+                    AssistantBridge.collectText(rootInActiveWindow)
+                }.getOrDefault("")
+            }
+        ) { keyword, action ->
+            Diag.log("assist", "命中「$keyword」→ $action")
+            Triggers.runAction(this, action, "assist")
+        }
+    }
 
     override fun onInterrupt() = Unit
 

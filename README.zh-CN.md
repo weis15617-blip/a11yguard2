@@ -69,4 +69,6 @@ Apache License 2.0
 
 ## 反馈
 
+**QQ 群：1067815429** —— 有问题、建议、或者想交流用法都可以进群。群内响应比 GitHub Issue 快。
+
 遇到问题请附上应用内导出的诊断日志（`文件管理 → Android/data/com.merin.a11yguard2/files/diag.log`），里面记录了每次保活和手势触发的实际结果，能大幅缩短排查时间。

@@ -137,6 +137,13 @@ Android 会定期清理后台的无障碍服务，尤其是在内存紧张、锁
 
 这是本应用唯一联网的功能，可完全关闭；不上传任何信息。发版流程见 [RELEASING.md](RELEASING.md)。
 
+## 反馈
+
+**QQ 群：1067815429** —— 有问题、建议、或者想交流用法都可以进群。
+
+提问题时请附上应用内「诊断」页的日志（也可从 `Android/data/com.merin.a11yguard2/files/diag.log` 取），
+里面记录了每次保活和手势触发的实际结果，能大幅缩短排查时间。
+
 ## 许可证
 
 Apache License 2.0，见 [LICENSE](LICENSE)。

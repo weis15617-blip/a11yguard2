@@ -13,6 +13,231 @@ import android.content.SharedPreferences
  */
 object AppSettings {
 
+    // ══════════════════ 语音控制 ══════════════════
+
+    /**
+     * 「助手界面触发」开关。
+     *
+     * 开启后，本服务会读取语音助手界面上的文字，匹配关键词后执行动作。
+     * 这是国内环境下最实用的方案 —— 不需要识别器可用，只要你手机的
+     * 语音助手能正常用。
+     */
+    fun assistantBridgeOn(ctx: Context): Boolean =
+        p(ctx).getBoolean("assistant_bridge_on", true)
+
+    fun setAssistantBridgeOn(ctx: Context, on: Boolean) {
+        p(ctx).edit().putBoolean("assistant_bridge_on", on).apply()
+    }
+
+    /**
+     * 监听的助手包名（换行分隔，用户可改）。空 = 用动态扫描结果。
+     *
+     * 动态扫描会查本机真正响应 ACTION_ASSIST / ACTION_VOICE_COMMAND 的应用，
+     * 再补上已知包名表。这样不用猜厂商包名，换机型也能用。
+     */
+    fun assistantPkgsRaw(ctx: Context): String {
+        val saved = p(ctx).getString("assistant_pkgs", "").orEmpty()
+        if (saved.isNotEmpty()) return saved
+        return runCatching {
+            AssistantBridge.discoverAssistantPkgs(ctx).joinToString("\n")
+        }.getOrElse {
+            AssistantBridge.KNOWN_ASSISTANT_PKGS.joinToString("\n")
+        }
+    }
+
+    fun setAssistantPkgsRaw(ctx: Context, raw: String) {
+        p(ctx).edit().putString("assistant_pkgs", raw).apply()
+    }
+
+    fun assistantPkgs(ctx: Context): List<String> =
+        assistantPkgsRaw(ctx).lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+    /**
+     * 指定的语音识别器组件（形如 `pkg/pkg.Class`）。空 = 用系统默认。
+     *
+     * 为什么允许手选：不同识别器差异极大 ——
+     *   · Google TTS 的识别器需要联网，国内常报 onError 11
+     *   · 厂商自带识别器多数离线可用
+     *   · 有的识别器只支持特定语言
+     * 不提供切换的话，默认那个不能用就等于功能废了。
+     */
+    fun voiceRecognizer(ctx: Context): String =
+        p(ctx).getString("voice_recognizer", "").orEmpty()
+
+    fun setVoiceRecognizer(ctx: Context, comp: String) {
+        p(ctx).edit().putString("voice_recognizer", comp.trim()).apply()
+    }
+
+
+    /**
+     * 语音关键词表。格式：「关键词|动作」每行一条。
+     *
+     * 动作格式与 Triggers.runAction 一致：
+     *   com.pkg/com.pkg.Service    切换该服务
+     *   ensure:com.pkg/...         确保开启
+     *   master                     切换守护服务
+     *
+     * 存成单个字符串而不是 Set/Map，是为了**保持顺序**：
+     * 匹配时长关键词优先，否则「解说」会抢在「开启解说」之前命中。
+     */
+    fun voiceKeywordsRaw(ctx: Context): String {
+        val saved = p(ctx).getString("voice_keywords", "").orEmpty()
+        if (saved.isNotEmpty()) return saved
+
+        // 首次使用：为手机里每个无障碍服务自动生成关键词，并落盘。
+        //
+        // 不在这里直接返回生成结果，而是写入 SharedPreferences ——
+        // 否则用户手动删掉不想要的条目后，下次读取又会重新生成。
+        val generated = generateKeywordsForInstalledServices(ctx)
+        if (generated.isNotEmpty()) {
+            p(ctx).edit().putString("voice_keywords", generated).apply()
+            Diag.log("voice", "已为 ${generated.lines().size / 2} 个服务自动生成关键词")
+            return generated
+        }
+        return DEFAULT_VOICE_KEYWORDS
+    }
+
+    /**
+     * 为手机里所有无障碍服务生成「开启X / 关闭X」关键词。
+     *
+     * 命名优先级：
+     *   1. 用户起的别名（aliasOf）—— 短中文名最好喊
+     *   2. 服务自带的 label —— 通常已经是中文（如"解说Max"）
+     *   3. 包名最后一段 —— 英文名兜底，用户之后可自己改成中文
+     *
+     * 每个服务两条：
+     *   开启X | ensure:<comp>     （只开不关，更安全）
+     *   关闭X | <comp>            （切换语义，当前是开就会关）
+     */
+    private fun generateKeywordsForInstalledServices(ctx: Context): String {
+        val rows: List<SvcRow> = runCatching { SvcRepo.all(ctx) }
+            .getOrDefault(emptyList<SvcRow>())
+            .filter { row -> row.comp.isNotEmpty() }
+        if (rows.isEmpty()) return ""
+
+        val sb = StringBuilder()
+        val used = mutableSetOf<String>()
+        var skipped = 0
+        var longNameCount = 0
+
+        rows.forEach { row ->
+            // 名字：别名 > 清洗后的 label > 跳过
+            val raw = aliasOf(ctx, row.comp, "").ifEmpty { row.label }
+            var name = cleanServiceName(raw)
+
+            // 英文名也要生成。
+            //
+            // 早期版本跳过了纯英文名，结果 TalkBack（Google 官方读屏）
+            // 被跳过 —— 而那恰恰是最主流的读屏，用户会说 "TalkBack"。
+            //
+            // 现在全都生成，只是对过长的英文串做截断（语音识别对短词更准）。
+            val hasChinese = name.any { it.code in 0x4E00..0x9FFF }
+            if (name.isEmpty()) {
+                skipped++
+                return@forEach
+            }
+            if (!hasChinese && name.length > 10) {
+                // 长英文串（如 Colordirectservice）：截到 10 字符
+                name = name.take(10)
+                longNameCount++
+            }
+
+            // 重名加序号
+            var finalName = name
+            if (used.contains(finalName)) {
+                var n = 2
+                while (used.contains("$finalName$n")) n++
+                finalName = "$finalName$n"
+            }
+            used.add(finalName)
+
+            val comp = SvcRepo.normalize(row.comp)
+            // 两种说法都生成：开启 / 打开
+            sb.append("开启").append(finalName).append('|').append("ensure:").append(comp).append('\n')
+            sb.append("打开").append(finalName).append('|').append("ensure:").append(comp).append('\n')
+            sb.append("关闭").append(finalName).append('|').append(comp).append('\n')
+            sb.append("关掉").append(finalName).append('|').append(comp).append('\n')
+        }
+
+        if (skipped > 0) {
+            Diag.log("voice", "跳过 $skipped 个无名称服务")
+        }
+        if (longNameCount > 0) {
+            Diag.log("voice", "$longNameCount 个超长英文名已截断，可在设置页手动改成中文")
+        }
+        return sb.toString().trimEnd()
+    }
+
+    /**
+     * 清洗服务名，让它能被人喊出来。
+     *
+     * 原始 label 常见形态：
+     *   "GKD伴生服务（请勿手动开启）"      → "GKD伴生服务"
+     *   "无障碍守护·点按代理"              → "点按代理"
+     *   "解说辅助服务"                     → "解说辅助服务"
+     *   "Car+车联"                        → "车联"
+     *   "AI写作"                          → "AI写作"
+     */
+    private fun cleanServiceName(raw: String): String {
+        var s = raw.trim()
+
+        // 1. 去掉括号内容（全角 + 半角）
+        s = s.replace(Regex("[（(][^）)]*[）)]"), "")
+
+        // 2. 去掉常见的系统提示词
+        listOf("伴生服务", "请勿手动开启", "请勿开启", "系统服务", "占位", "placeholder")
+            .forEach { s = s.replace(it, "", ignoreCase = true) }
+
+        // 3. "·" 之后是修饰，取主体
+        if (s.contains('·')) {
+            val parts = s.split('·').filter { it.isNotBlank() }
+            // 取最后一个有中文的部分（"无障碍守护·点按代理" → "点按代理"）
+            s = parts.lastOrNull { p -> p.any { it.code in 0x4E00..0x9FFF } } ?: parts.last()
+        }
+
+        // 4. 去掉特殊符号和空白
+        s = s.replace(" ", "").replace("|", "")
+        s = s.replace(Regex("""[+ /\[\]{}<>#@!$%^&*_=~`｜、，,。.]"""), "")
+
+        // 5. 太长就截断（语音识别对小段落更准）
+        if (s.length > 8) s = s.take(8)
+
+        return s.trim()
+    }
+
+    fun setVoiceKeywordsRaw(ctx: Context, raw: String) {
+        p(ctx).edit().putString("voice_keywords", raw).apply()
+    }
+
+    /** 解析成 (关键词, 动作) 列表。格式错误的行会被忽略。 */
+    fun voiceKeywords(ctx: Context): List<Pair<String, String>> =
+        voiceKeywordsRaw(ctx)
+            .lines()
+            .mapNotNull { line ->
+                val s = line.trim()
+                if (s.isEmpty() || !s.contains('|')) return@mapNotNull null
+                val k = s.substringBefore('|').trim()
+                val v = s.substringAfter('|').trim()
+                if (k.isEmpty() || v.isEmpty()) null else k to v
+            }
+
+    /**
+     * 默认关键词。
+     *
+     * 为什么给「开启解说」和「打开解说」都配：语音识别对口语说法不固定，
+     * 同一个意图可能有多种表达，多给几个同义词命中率会高很多。
+     */
+    val DEFAULT_VOICE_KEYWORDS: String = listOf(
+        "开启解说" to "ensure:com.nirenr.talkman/com.nirenr.talkman.TalkManAccessibilityService",
+        "打开解说" to "ensure:com.nirenr.talkman/com.nirenr.talkman.TalkManAccessibilityService",
+        "启动解说" to "ensure:com.nirenr.talkman/com.nirenr.talkman.TalkManAccessibilityService",
+        "关闭解说" to "com.nirenr.talkman/com.nirenr.talkman.TalkManAccessibilityService",
+        "关掉解说" to "com.nirenr.talkman/com.nirenr.talkman.TalkManAccessibilityService",
+        "停止解说" to "com.nirenr.talkman/com.nirenr.talkman.TalkManAccessibilityService",
+        "开启守护" to "ensure:master",
+        "关闭守护" to "master"
+    ).joinToString("\n") { it.first + "|" + it.second }
+
     const val ACT_NONE = "none"
     const val ACT_MASTER = "master"
 
@@ -178,6 +403,54 @@ object AppSettings {
         p(ctx).edit().putBoolean("lock_allow_$kind", allow).apply()
     }
 
+    /**
+     * 默认震动幅度（0-255）。取 30 —— Android 幅度刻度里属于"轻触"。
+     * 不是 255：那是"最大能力"，手感过硬。
+     */
+    const val DEFAULT_AMPLITUDE = 12
+
+    /**
+     * 某个功能的震动幅度（0-255）。
+     *
+     * 与时长**分开存**，因为用户可能想要"短而强"或"长而轻"，
+     * 只绑一个维度表达不出来。
+     */
+    fun vibAmp(ctx: Context, kind: String): Int =
+        p(ctx).getInt("vib_amp_$kind", DEFAULT_AMPLITUDE).coerceIn(0, 255)
+
+    fun setVibAmp(ctx: Context, kind: String, amp: Int) {
+        p(ctx).edit().putInt("vib_amp_$kind", amp.coerceIn(0, 255)).apply()
+    }
+
+    /**
+     * 「触发成功时震动」总开关，默认开启。
+     *
+     * 独立于各手势档位：有人希望"过程完全静默、成功也不震"，
+     * 只要把这一个开关关掉即可，不必逐个手势去调。
+     *
+     * 优先级：vibAllOff（全关）> 本开关（成功震动）> 手势档位。
+     */
+    fun vibOnSuccess(ctx: Context): Boolean = p(ctx).getBoolean("vib_on_success", true)
+
+    /**
+     * 过程（计数中）的震动幅度。
+     *
+     * ── 为什么必须与成功震动分开 ──
+     *
+     * 用户的原话："平时在摇的过程当中或者敲击的过程当中，震动都不要太强烈，
+     * 都很弱，只有在触发成功的时候，这个震动可以强一点。"
+     *
+     * 早期两处共用同一个幅度，结果是每计一次数都"咚"一下很重，
+     * 整个敲击/摇动过程都在被强震打断。
+     *
+     * 现在固定为 8（羽毛级）：只给"我收到了"的微弱提示，不打断手感。
+     * 成功时才用用户设置的档位。
+     */
+    const val TICK_AMPLITUDE = 6
+
+    /** 过程震动的默认时长（毫秒）。12ms 极短，配合小幅度才真正"轻"。 */
+    const val TICK_MS = 10
+
     /** 某个功能的震动是否开启（默认全开）。总开关关闭时一律 false。 */
     fun vibOn(ctx: Context, kind: String): Boolean {
         if (vibAllOff(ctx)) return false
@@ -189,7 +462,7 @@ object AppSettings {
     }
 
     /** 每个功能的震动时长（毫秒），独立配置。0 = 不震。 */
-    fun vibMs(ctx: Context, kind: String, fallback: Int = 35): Int =
+    fun vibMs(ctx: Context, kind: String, fallback: Int = 14): Int =
         p(ctx).getInt("vib_ms_$kind", fallback)
 
     fun setVibMs(ctx: Context, kind: String, ms: Int) {
@@ -259,7 +532,7 @@ object AppSettings {
     fun volWindowMs(ctx: Context): Int = p(ctx).getInt("trigger_window_ms", 300)
 
     /** 通用震动时长（毫秒），旧版默认 200；档位 轻60 / 中110 / 标准200 / 强250。 */
-    fun genVibMs(ctx: Context): Int = p(ctx).getInt("gen_vib", 200)
+    fun genVibMs(ctx: Context): Int = p(ctx).getInt("gen_vib", 14)
 
     // ---------- 锁屏 / 解锁 ----------
 

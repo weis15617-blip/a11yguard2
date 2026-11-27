@@ -29,7 +29,7 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
         /** 本次算出的变化率 */
         val speed: Float,
         /** 阈值 */
-        val threshold: Float,
+        val threshold: Int,
         /** 当前累计次数 */
         val count: Int,
         /** 需要的次数 */
@@ -51,10 +51,17 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
     /** 计次过程中的弱震动时长；0 = 不震。 */
     private var tickVibMs = 0
 
-    private var state = ShakeLogic.State()
+    /** 上次计数震动的时刻，用于限流。 */
+    private var lastTickAt = 0L
+
+    /** 上次计数震动时的 count（只在 count 变化时才震）。 */
+    private var lastTickCount = -1
+
+    /** Square Seismic 检测器（内部维护滑动窗口）。 */
+    private var detector = ShakeLogic.Detector()
 
     /** 当前生效的变化率阈值（由灵敏度档位算出）。 */
-    private var forceThreshold = ShakeLogic.DEFAULT_FORCE_THRESHOLD
+    private var forceThreshold = ShakeLogic.DEFAULT_THRESHOLD
 
     /** 当前生效的摇动次数。 */
     private var needCount = ShakeLogic.SHAKE_COUNT
@@ -64,10 +71,10 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
         // 过程弱震动：开关关闭或总闸关闭时为 0（不震）
         tickVibMs = if (AppSettings.shakeTickVibOn(ctx)) AppSettings.shakeTickVibMs(ctx) else 0
         val level = AppSettings.shakeSensitivity(ctx)
-        forceThreshold = ShakeLogic.forceForSensitivity(level)
+        forceThreshold = ShakeLogic.thresholdForSensitivity(level)
         needCount = AppSettings.shakeCount(ctx)
         resetCounts()
-        Diag.log("shake", "reload 灵敏度=$level 阈值=%.0f 次数=$needCount".format(forceThreshold))
+        Diag.log("shake", "reload 灵敏度=$level 阈值=${forceThreshold}m/s² 次数=$needCount")
     }
 
     fun start() {
@@ -103,7 +110,7 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
     }
 
     fun resetCounts() {
-        state = ShakeLogic.State()
+        detector.reset()
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -114,8 +121,15 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
         val z = e.values[2]
         val now = SystemClock.elapsedRealtime()
 
-        val r = ShakeLogic.step(state, now, x, y, z, forceThreshold, needCount)
-        state = r.state
+        // 新签名：直接传三轴原始值与纳秒时间戳（Square Seismic 用模长平方判定）
+        val r = detector.step(
+            timestampNs = e.timestamp,
+            ax = x, ay = y, az = z,
+            threshold = forceThreshold,
+            needCount = needCount,
+            nowMs = System.currentTimeMillis()
+        )
+
 
         runCatching {
             testListener?.invoke(
@@ -125,7 +139,7 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
                     count = r.count,
                     need = needCount,
                     verdict = r.verdict,
-                    peakSpeed = state.peakSpeed,
+                    peakSpeed = kotlin.math.sqrt(r.peakMagSq),
                     triggered = r.triggered
                 )
             )
@@ -133,15 +147,38 @@ class ShakeWatcher(private val ctx: Context, private val onTrigger: () -> Unit) 
 
         when {
             r.triggered -> {
-                Diag.log("shake", "triggered speed=%.0f peak=%.0f".format(r.speed, state.peakSpeed))
-                Triggers.vibrate(ctx, vibMs, AppSettings.VIB_SHAKE)
+                Diag.log("shake", "triggered speed=%.0f peak=%.0f hot=%.0f%%".format(r.speed, kotlin.math.sqrt(r.peakMagSq), r.hotRatio * 100))
+                // 成功震动受总开关控制（默认开）
+                if (AppSettings.vibOnSuccess(ctx)) {
+                    Triggers.vibrate(
+                        ctx, vibMs, AppSettings.VIB_SHAKE,
+                        AppSettings.vibAmp(ctx, AppSettings.VIB_SHAKE)
+                    )
+                }
+                // 触发后重置计数追踪，下次摇动重新开始
+                lastTickCount = -1
+                lastTickAt = 0L
                 onTrigger()
             }
             r.verdict == ShakeLogic.Verdict.COUNTING -> {
                 Diag.log("shake", "计数 %d/%d speed=%.0f".format(r.count, needCount, r.speed))
-                // 过程弱震：让用户能数出"还差几次"
-                if (tickVibMs > 0) {
-                    Triggers.vibrate(ctx, tickVibMs, AppSettings.VIB_SHAKE)
+                // 过程弱震：让用户能数出"还差几次"。
+                //
+                // 限流有两个条件，缺一不可：
+                //   1. count 必须变化（否则摇动中每个采样点都会震 → 变成连续嗡鸣）
+                //   2. 距上次至少 180ms（避免快速连震听感糊成一片）
+                val nowMs = SystemClock.elapsedRealtime()
+                val countChanged = r.count != lastTickCount
+                val cooled = nowMs - lastTickAt >= 180L
+                if (tickVibMs > 0 && countChanged && cooled) {
+                    lastTickCount = r.count
+                    lastTickAt = nowMs
+                    Triggers.vibrate(
+                        ctx,
+                        tickVibMs,
+                        AppSettings.VIB_SHAKE,
+                        AppSettings.TICK_AMPLITUDE
+                    )
                 }
             }
             r.verdict == ShakeLogic.Verdict.COOLDOWN ->

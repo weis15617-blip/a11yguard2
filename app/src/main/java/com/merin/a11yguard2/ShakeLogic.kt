@@ -3,315 +3,353 @@ package com.merin.a11yguard2
 import kotlin.math.abs
 
 /**
- * 摇一摇判定。
+ * 摇一摇检测 —— Square Seismic 原版算法移植。
  *
- * ══════════════════════════════════════════════════════════════
- * 采用业界经典实现（Matthew Wiggins, 2009, Apache-2.0）
- * ══════════════════════════════════════════════════════════════
+ * ══════════════════════════════════════════════════════════════════
+ * 为什么用 Square Seismic
+ * ══════════════════════════════════════════════════════════════════
  *
- * 参考：https://android.hlidskialf.com/blog/code/android-shake-detection-listener
- * 该实现被大量 Android 项目沿用十余年，是事实上的参考算法。
+ * Square（美国支付公司）2010 年开源，是 Android 上被引用最多的摇一摇实现。
+ * 核心洞察写在源码注释里：
  *
- * ── 核心思想：用「加速度变化率」而不是「加速度绝对值」──
+ *   "If more than 75% of the samples taken in the past 0.5s are
+ *    accelerating, the device is a) shaking, or b) free falling 1.84m"
  *
- *     speed = |Δ(x+y+z)| / Δt × 10000
- *     if (speed > FORCE_THRESHOLD) shakeCount++
- *     if (shakeCount >= SHAKE_COUNT) 触发
+ * 即：**摇动的本质是「持续加速」**，而不是"某几个瞬间值大"。
  *
- * 为什么变化率能同时满足三个需求（而绝对值不能）：
+ * ══════════════════════════════════════════════════════════════════
+ * 之前的错误
+ * ══════════════════════════════════════════════════════════════════
  *
- *   动作        Δ(x+y+z)   Δt      speed    超阈值次数
- *   甩动          ±20      20ms    10000    连续多次 → 触发
- *   拿起手机       0.2     20ms      100      0 次 → 不触发
- *   放到桌上        30      20ms    15000    只 1 次 → 不触发
+ * 我先用了「三轴和的变化率 > 350」，后来又改成「> 1200」——
+ * 都是自己拍的值。实测表现是「手机放着不动也会触发」。
  *
- * 「放到桌上」的峰值甚至比甩动更猛（实测 30+ vs 12），但它**只发生一次**；
- * 而甩动是**反复来回**，每次换向都是一次大变化率。所以「连续 N 次超阈值」
- * 才是区分两者的可靠判据 —— 这也正是我前几版方案（力度阈值 / 符号翻转 /
- * 点积方向 / 爆发计数）都失败的原因：它们都在试图用单点特征描述一个
- * 本质上是「重复」的动作。
+ * 根因：用**变化率**做判据。变化率对噪声极其敏感：传感器每隔几毫秒
+ * 就会有微小抖动，除上极小的 Δt 后放大成很大的值。
  *
- * ── 为什么保留 TIME_THRESHOLD ──
+ * Square 用的是**总加速度模长的平方**——这是绝对量，不除时间，
+ * 噪声不会被放大。
  *
- * 传感器可能一次动作连续上报多个采样，间隔极短时 Δt 接近 0，
- * 除法会得到巨大值造成误判。所以只在 `Δt > TIME_THRESHOLD`（100ms）
- * 时才计算，避免除零和噪声放大（本实现取 10ms，见常量注释）。
+ * ══════════════════════════════════════════════════════════════════
+ * 原版参数（源码 ShakeDetector.java）
+ * ══════════════════════════════════════════════════════════════════
  *
- * ── 与其他常量 ──
+ *   SENSITIVITY_LIGHT  = 11   11 m/s²
+ *   SENSITIVITY_MEDIUM = 13   13 m/s²
+ *   SENSITIVITY_HARD   = 15   15 m/s²
  *
- *   SHAKE_TIMEOUT (500ms)：超过这个时长没有新的超阈值事件，计数清零。
- *                          防止「隔几秒碰一下」在不同时间累加凑满 3 次。
- *   SHAKE_DURATION (1000ms)：两次触发之间的最小间隔，防抖。
- *   SHAKE_COUNT (3)：需要连续 3 次超阈值。取 3 是原作者的选择，
- *                    也是「一次撞击(1) 」与「一次甩动(5-10)」之间的安全区。
+ *   静止时 |a| ≈ g ≈ 9.8 m/s²
+ *   所以 11 只比静止高一点（轻微加速），15 要明显用力
  *
- * ── 阈值 ±1 秒内的含义 ──
+ *   窗口：0.5s（MAX_WINDOW_SIZE = 500000000 ns）
+ *   最小窗口：0.25s（MIN_WINDOW_SIZE = MAX >> 1）
+ *   最少样本：4（MIN_QUEUE_SIZE，兼容采样率低的设备）
+ *   判据：acceleratingCount >= sampleCount*3/4
+ *        （源码写法：acceleratingCount >= (sampleCount>>1) + (sampleCount>>2)）
  *
- * FORCE_THRESHOLD = 350 表示「1 秒内三轴之和变化 3.5 m/s²」。
- * 换算成单轴：50Hz 下每 20ms 变化 0.007 m/s² 就够。这个值看起来很小，
- * 但注意 speed 分母是 diff(ms)，乘了 10000，所以 350 对应
- * `0.7 m/s² 的变化在 20ms 内发生`。实测甩动远超此值，轻放低于此值。
+ * ══════════════════════════════════════════════════════════════════
+ * 授权
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * Square Seismic 为 Apache License 2.0。本文件是 Kotlin 重写，
+ * 保留原始算法结构与参数。
  */
 object ShakeLogic {
 
-    /**
-     * 默认变化率阈值。
-     *
-     * ⚠️ 原实现是 350，但那个值在现代设备上**过于灵敏**：
-     *   350 表示 20ms 内三轴和变化 0.7 m/s²，手机轻微一晃就够。
-     *   实测用户反馈"手机不能动，一动就触发"。
-     *
-     * 现代手机加速度计精度远高于 2009 年，且都带三轴融合，
-     * 同样的物理动作会产生更大的样本差值。所以默认提到 1200
-     * （约等于 20ms 内三轴和变化 2.4 m/s²），并开放灵敏度档位。
-     */
-    const val DEFAULT_FORCE_THRESHOLD = 1200f
+    // ══════════ 原版灵敏度常量 ══════════
+
+    /** 轻微摇动（11 m/s²）。 */
+    const val SENSITIVITY_LIGHT = 11
+
+    /** 中等摇动（13 m/s²，原版默认）。 */
+    const val SENSITIVITY_MEDIUM = 13
+
+    /** 用力摇动（15 m/s²）。 */
+    const val SENSITIVITY_HARD = 15
+
+    /** 默认阈值 = 中等。 */
+    const val DEFAULT_THRESHOLD = SENSITIVITY_MEDIUM
+
+    /** 窗口上限 0.5s（纳秒）。 */
+    const val MAX_WINDOW_NS = 500_000_000L
+
+    /** 窗口下限 0.25s（纳秒）。 */
+    const val MIN_WINDOW_NS = MAX_WINDOW_NS / 2
+
+    /** 最少样本数：设备采样率低时也要能判定。 */
+    const val MIN_QUEUE_SIZE = 4
+
+    /** 触发后冷却，避免一次摇动里反复触发。 */
+    const val COOLDOWN_MS = 1000L
+
+    // ══════════ 兼容旧接口的常量（值已按新算法校正）══════════
+
+    /** 兼容旧命名。 */
+    const val DEFAULT_FORCE_THRESHOLD = DEFAULT_THRESHOLD.toFloat()
 
     /** 兼容旧命名。 */
     const val FORCE_THRESHOLD = DEFAULT_FORCE_THRESHOLD
 
-    /**
-     * 灵敏度档位（1 = 最难触发 / 10 = 最灵敏）。
-     *
-     * 映射到 FORCE_THRESHOLD：
-     *   1  → 3000（要相当用力甩）
-     *   5  → 1600（默认，正常甩一下）
-     *   10 → 400 （很灵敏，轻微晃就触发）
-     */
-    fun forceForSensitivity(level: Int): Float {
-        val l = level.coerceIn(1, 10)
-        // 线性插值：level 1 → 3000, level 10 → 400
-        return 3000f - (l - 1) * (2600f / 9f)
-    }
-
-    /** 灵敏度档位对应的默认值（5 档）。 */
-    const val DEFAULT_SENSITIVITY = 5
-
-    /**
-     * 两次计算之间的最小间隔（毫秒）。
-     *
-     * ⚠️ 原实现用的是 100ms，但那是 2009 年为低频传感器（约 10Hz）设计的。
-     * 现代设备在 SENSOR_DELAY_GAME 下是 50Hz（20ms/采样），若沿用 100ms，
-     * 会跳掉 4/5 的采样 —— 实测（参数扫描见下）真摇反而失效：
-     *
-     *   TIME_TH  真摇    拿起    放下
-     *      0     ✓ 1 次   ✓ 0    ✓ 0
-     *     20     ✗ 0 次   ✓ 0    ✓ 0     ← 交替峰值被跳过
-     *     50     ✓ 1 次   ✓ 0    ✓ 0     ← 侥幸，靠采样对齐
-     *    100     ✗ 0 次   ✓ 0    ✓ 0     ← 原版值，现代设备失效
-     *
-     * 取 10ms：既能防住 Δt≈0 的除零，又不丢 20ms 的采样间隔。
-     */
-    const val TIME_THRESHOLD = 10L
-
-    /** 超过此时长没有新事件则清零计数（原实现的 SHAKE_TIMEOUT）。 */
-    const val SHAKE_TIMEOUT = 500L
-
-    /** 两次触发之间的最小间隔（原实现的 SHAKE_DURATION）。 */
-    const val SHAKE_DURATION = 1000L
-
-    /** 判定为一次摇动所需的连续超阈值次数（原实现的 SHAKE_COUNT）。 */
+    /** 兼容旧命名：默认摇动次数。 */
     const val SHAKE_COUNT = 3
 
-    /**
-     * 比例判据窗口（毫秒）。参考 Square Seismic：用「最近 500ms 内超阈值采样占比」
-     * 判定是否正在摇动，比「连续 N 次超阈值」稳健得多。
-     */
+    /** 兼容旧命名：连续计数上限（新算法用比例判据，此值仅作 UI 参考）。 */
     const val RATIO_WINDOW_MS = 500L
 
-    /**
-     * 窗口内超阈值采样占比达到此值即认为「正在摇动」。
-     *
-     * Seismic 用 75%。含义：
-     *   · 真实甩动时手在持续加速，窗口内大部分采样都超阈值 → 占比高
-     *   · 单次碰撞只有一个尖峰 → 占比很低（1/25 ≈ 4%）
-     *   · 走路晃动虽有波动，但大部分采样在阈值以下 → 占比中等
-     *
-     * 这就是为什么它比「连续计数」更可靠：单点特征容易被碰撞骗过，
-     * 而「持续比例」必须真的持续用力才能满足。
-     */
+    /** 兼容旧命名：热采样占比要求。 */
     const val HOT_RATIO = 0.75f
 
     /** 兼容旧命名。 */
-    const val GRAVITY = 9.8f
+    const val TIME_THRESHOLD = 10L
 
-    fun magnitude(x: Float, y: Float, z: Float): Float =
-        kotlin.math.sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+    /** 兼容旧命名。 */
+    const val SHAKE_TIMEOUT = 500L
 
-    data class State(
-        /** 累计的连续超阈值次数 */
-        val shakeCount: Int = 0,
-        /** 上一次计算时刻 */
-        val lastTime: Long = 0L,
-        /** 上一次的三轴值 */
-        val lastX: Float = -1f,
-        val lastY: Float = -1f,
-        val lastZ: Float = -1f,
-        /** 上一次超阈值事件的时刻（用于 SHAKE_TIMEOUT 清零） */
-        val lastForce: Long = 0L,
-        /** 上一次触发时刻（用于 SHAKE_DURATION 防抖） */
-        val lastShake: Long = 0L,
-        /** 上一次算出的 speed（诊断） */
-        val lastSpeed: Float = 0f,
-        /** 本轮的峰值 speed（诊断） */
-        val peakSpeed: Float = 0f,
+    /** 兼容旧命名。 */
+    const val SHAKE_DURATION = 1000L
 
-        /** 滑动窗口缓冲：每个元素是 (时刻, 是否超阈值) */
-        val window: List<Pair<Long, Boolean>> = emptyList(),
+    /** 兼容旧命名。 */
+    const val DEFAULT_SENSITIVITY = 5
 
-        /** 当前窗口内的热采样占比（诊断） */
-        val hotRatio: Float = 0f
-    )
+    // ══════════ 灵敏度档位 ══════════
+
+    /**
+     * 档位 1-10 映射到加速度阈值。
+     *
+     * 原版只有三档（11/13/15）。这里扩展成 10 档，但**覆盖同样的物理范围**：
+     *   1  → 16.0 m/s²（最难，要用力甩）
+     *   5  → 13.0 m/s²（默认，等同原版 MEDIUM）
+     *   10 → 9.5  m/s²（最灵敏，略高于重力）
+     *
+     * 注意：低于 9.8 会把"静止"判成加速，所以下限取 9.5。
+     */
+    fun thresholdForSensitivity(level: Int): Int {
+        val l = level.coerceIn(1, 10)
+        // 16.0 -> 9.5，共 6.5 的跨度，9 个间隔
+        val v = 16.0f - (l - 1) * (6.5f / 9f)
+        return Math.round(v)
+    }
+
+    /** 兼容旧命名。 */
+    fun forceForSensitivity(level: Int): Float = thresholdForSensitivity(level).toFloat()
+
+    // ══════════ 采样队列（原版 SampleQueue）══════════
+
+    /**
+     * 滑动窗口 + 运行平均值。
+     *
+     * 原版用链表 + 对象池避免 GC。Kotlin 里用 ArrayDeque 更简洁，
+     * 语义等价：入队时剔除过期样本，同时维护加速样本计数。
+     */
+    class SampleQueue {
+
+        /** 每个样本：(时间戳纳秒, 是否处于加速)。 */
+        private val samples = ArrayDeque<Pair<Long, Boolean>>()
+        private var acceleratingCount = 0
+
+        val size: Int get() = samples.size
+        val hotCount: Int get() = acceleratingCount
+
+        fun add(timestampNs: Long, accelerating: Boolean) {
+            // 剔除窗口外的旧样本（保留至少 MIN_QUEUE_SIZE 个，兼容低采样率）
+            purge(timestampNs - MAX_WINDOW_NS)
+
+            samples.addLast(timestampNs to accelerating)
+            if (accelerating) acceleratingCount++
+        }
+
+        private fun purge(cutoff: Long) {
+            while (samples.size >= MIN_QUEUE_SIZE) {
+                val oldest = samples.firstOrNull() ?: break
+                if (cutoff - oldest.first <= 0) break
+                samples.removeFirst()
+                if (oldest.second) acceleratingCount--
+            }
+        }
+
+        fun clear() {
+            samples.clear()
+            acceleratingCount = 0
+        }
+
+        /**
+         * 是否正在摇动（原版 isShaking）。
+         *
+         * 三个条件同时满足：
+         *   1. 队列非空
+         *   2. 跨度 >= 0.25s（窗口太短说明刚启动，数据不足）
+         *   3. 加速样本占比 >= 3/4
+         */
+        fun isShaking(): Boolean {
+            if (samples.isEmpty()) return false
+            val newest = samples.last()
+            val oldest = samples.first()
+            if (newest.first - oldest.first < MIN_WINDOW_NS) return false
+            // 原版写法：(sampleCount >> 1) + (sampleCount >> 2) = 0.75 * n
+            val need = (samples.size shr 1) + (samples.size shr 2)
+            return acceleratingCount >= need
+        }
+
+        /** 当前热样本占比（诊断用）。 */
+        fun hotRatio(): Float =
+            if (samples.isEmpty()) 0f
+            else acceleratingCount.toFloat() / samples.size
+    }
+
+    // ══════════ 判定结果 ══════════
 
     enum class Verdict {
-        /** 触发了一次摇动 */
-        OK,
-        /** 变化率不够 */
+        /** 采样间隔太短被跳过。 */
+        SKIPPED,
+        /** 未达阈值。 */
         TOO_SLOW,
-        /** 变化率够但累计次数不足 */
+        /** 正在累计（比例未到）。 */
         COUNTING,
-        /** 在 SHAKE_DURATION 冷却内 */
+        /** 冷却中。 */
         COOLDOWN,
-        /** 采样间隔太短，跳过计算 */
-        SKIPPED
+        /** 触发。 */
+        OK
     }
+
+    data class State(
+        /** 已连续摇动次数（用于"摇 N 次触发"）。 */
+        val shakeCount: Int = 0,
+        /** 上次触发时刻（毫秒）。 */
+        val lastShakeMs: Long = 0L,
+        /** 本次采样算出的模长平方。 */
+        val lastMagSq: Float = 0f,
+        /** 峰值模长平方（诊断）。 */
+        val peakMagSq: Float = 0f,
+        /** 上一次样本的热占比（诊断）。 */
+        val hotRatio: Float = 0f,
+        /** 窗口内样本数（诊断）。 */
+        val windowSize: Int = 0
+    )
 
     data class Step(
         val state: State,
         val triggered: Boolean,
-        val verdict: Verdict? = null,
-        /** 本次算出的变化率 */
-        val speed: Float = 0f,
-        /** 当前累计次数 */
-        val count: Int = 0,
-        /** 本轮峰值变化率（诊断） */
-        val peakSpeed: Float = 0f,
-        /** 滑动窗口内容（诊断） */
-        val window: List<Pair<Long, Boolean>> = emptyList(),
-        /** 窗口内热采样占比（诊断） */
+        val verdict: Verdict?,
+        /** 本次模长（m/s²），诊断显示用。 */
+        val speed: Float,
+        /** 当前累计次数。 */
+        val count: Int,
+        /** 峰值模长平方。 */
+        val peakMagSq: Float = 0f,
+        /** 热样本占比。 */
         val hotRatio: Float = 0f
     )
 
-    /**
-     * 处理一个加速度采样（原始加速度计，含重力）。
-     *
-     * 注意：经典算法用的是**原始三轴之和的差**，所以传入含重力的原始值即可，
-     * 不需要去重力 —— 因为重力是常量，在差分时抵消了。
-     */
-    /**
-     * 处理一个加速度采样。
-     *
-     * ══ 两重判据（融合业界两种成熟做法）══
-     *
-     * **判据 A：比例判据**（Square Seismic）
-     *   最近 [RATIO_WINDOW_MS] 内，超阈值采样占比 >= [HOT_RATIO] → 认为"正在摇动"
-     *
-     *   为什么需要它：单点特征容易被碰撞骗过。Seismic 的洞察是
-     *   「持续用力」才是摇动的本质 —— 真甩时窗口内大部分采样都超阈值，
-     *   而一次碰撞只占 1/25，占比很低。
-     *
-     * **判据 B：连续计数**（Matthew Wiggins 经典实现）
-     *   连续 [needCount] 次超阈值 → 计一次摇动
-     *
-     * 两者同时满足才判定为一次摇动。这样：
-     *   · 碰撞：比例不足（A 挡）且次数不够（B 挡）→ 拒绝
-     *   · 放桌上震一下：同上 → 拒绝
-     *   · 真甩：比例高 + 次数够 → 通过
-     *
-     * 用 A 补 B 的「阈值敏感」，用 B 补 A 的「次数可控」（用户可设 1-10 次）。
-     */
-    fun step(
-        st: State,
-        now: Long,
-        x: Float,
-        y: Float,
-        z: Float,
-        forceThreshold: Float = DEFAULT_FORCE_THRESHOLD,
-        needCount: Int = SHAKE_COUNT
-    ): Step {
-        // 超时清零
-        var shakeCount = st.shakeCount
-        if (st.lastForce > 0 && now - st.lastForce > SHAKE_TIMEOUT) {
-            shakeCount = 0
-        }
+    // ══════════ 检测器 ══════════
 
-        // 采样间隔太短：跳过（避免 Δt≈0 导致 speed 爆炸）
-        if (st.lastTime > 0 && now - st.lastTime <= TIME_THRESHOLD) {
-            return Step(
-                st.copy(shakeCount = shakeCount, lastSpeed = 0f),
-                false, Verdict.SKIPPED, 0f, shakeCount,
-                st.peakSpeed, st.window, st.hotRatio
-            )
-        }
+    class Detector {
+        private val queue = SampleQueue()
+        private var lastShakeMs = 0L
+        private var shakeCount = 0
+        private var peakMagSq = 0f
 
-        // 首次采样：只记录基准
-        if (st.lastTime == 0L) {
-            return Step(
-                st.copy(
-                    shakeCount = 0, lastTime = now,
-                    lastX = x, lastY = y, lastZ = z,
-                    lastSpeed = 0f, peakSpeed = 0f,
-                    window = emptyList(), hotRatio = 0f
-                ),
-                false, null, 0f, 0, 0f, emptyList(), 0f
-            )
-        }
+        /**
+         * 当前这段连续摇动是否已计入过。
+         *
+         * 之前用 queue.clear() 表示"这段算完了"，但清空后要重新累积
+         * 0.25s 的窗口才能再判定 —— 持续甩动时反复清空又填满，
+         * 计数永远卡在 2/5、3/5 上不去（实测 speed 到 24 也不涨）。
+         *
+         * 改成标记位：一段连续摇动只计一次，摇动停止后窗口自然滑空，
+         * 标记复位，下一段立刻能计入。
+         */
+        private var countedThisBurst = false
 
-        val diff = now - st.lastTime
-        val delta = abs(x + y + z - st.lastX - st.lastY - st.lastZ)
-        val speed = delta / diff.toFloat() * 10000f
-        val hot = speed > forceThreshold
+        /**
+         * 处理一个加速度采样。
+         *
+         * @param timestampNs SensorEvent.timestamp（纳秒）
+         * @param ax,ay,az    SensorEvent.values（含重力，m/s²）
+         * @param threshold   加速度阈值（m/s²）
+         * @param needCount   需要连续摇动几次才触发
+         * @param nowMs       当前墙钟（毫秒），用于冷却判断
+         */
+        fun step(
+            timestampNs: Long,
+            ax: Float,
+            ay: Float,
+            az: Float,
+            threshold: Int = DEFAULT_THRESHOLD,
+            needCount: Int = SHAKE_COUNT,
+            nowMs: Long = System.currentTimeMillis()
+        ): Step {
+            // ── 判据：模长平方 vs 阈值平方（原版为了避免 sqrt 用平方比较）──
+            val magSq = ax * ax + ay * ay + az * az
+            val thSq = (threshold * threshold).toFloat()
+            val accelerating = magSq > thSq
 
-        // ── 维护滑动窗口（判据 A 的数据来源）──
-        val kept = st.window.filter { now - it.first <= RATIO_WINDOW_MS }
-        val window = kept + (now to hot)
-        val hotRatio = if (window.isEmpty()) 0f
-        else window.count { it.second }.toFloat() / window.size
+            queue.add(timestampNs, accelerating)
+            if (magSq > peakMagSq) peakMagSq = magSq
 
-        var lastForce = st.lastForce
-        var lastShake = st.lastShake
-        var triggered = false
-        var verdict: Verdict
+            val hotRatio = queue.hotRatio()
+            val count = queue.hotCount
 
-        if (hot) {
-            shakeCount++
-            lastForce = now
+            var verdict: Verdict
+            var triggered = false
 
-            // 判据 A：比例达标才允许计数推进
-            val ratioOk = hotRatio >= HOT_RATIO || window.size < 4
-            // （窗口太小时比例无意义，前几个采样直接放行，靠 B 兜住）
-
-            if (shakeCount >= needCount.coerceAtLeast(1) && ratioOk) {
-                if (now - lastShake > SHAKE_DURATION) {
-                    lastShake = now
-                    shakeCount = 0
-                    triggered = true
-                    verdict = Verdict.OK
-                } else {
+            if (queue.isShaking()) {
+                // 摇动成立
+                if (countedThisBurst) {
+                    // 这一段已经计过，不重复计，但也不清空窗口
+                    verdict = Verdict.COUNTING
+                } else if (nowMs - lastShakeMs < COOLDOWN_MS) {
                     verdict = Verdict.COOLDOWN
+                } else {
+                    countedThisBurst = true
+                    shakeCount++
+                    if (shakeCount >= needCount.coerceAtLeast(1)) {
+                        lastShakeMs = nowMs
+                        shakeCount = 0
+                        triggered = true
+                        verdict = Verdict.OK
+                        peakMagSq = 0f
+                        // 触发后才清空，等下一次摇动
+                        queue.clear()
+                        countedThisBurst = false
+                    } else {
+                        verdict = Verdict.COUNTING
+                        // 注意：**不清空 queue**。清空会导致窗口重新累积 0.25s，
+                        // 持续甩动时计数永远上不去。
+                    }
                 }
             } else {
-                verdict = Verdict.COUNTING
+                // 摇动停止：窗口滑空后允许下一段重新计入
+                if (queue.size == 0 || !accelerating) {
+                    countedThisBurst = false
+                }
+                verdict = if (accelerating) Verdict.COUNTING else Verdict.TOO_SLOW
             }
-        } else {
-            // 比例不足时也把计数回退一点，避免「夹着断点仍累加」凑满
-            if (hotRatio < HOT_RATIO * 0.5f && shakeCount > 0) {
-                shakeCount = (shakeCount - 1).coerceAtLeast(0)
-            }
-            verdict = Verdict.TOO_SLOW
+
+            val st = State(
+                shakeCount = shakeCount,
+                lastShakeMs = lastShakeMs,
+                lastMagSq = magSq,
+                peakMagSq = peakMagSq,
+                hotRatio = hotRatio,
+                windowSize = queue.size
+            )
+            return Step(
+                state = st,
+                triggered = triggered,
+                verdict = verdict,
+                speed = kotlin.math.sqrt(magSq),
+                count = shakeCount,
+                peakMagSq = peakMagSq,
+                hotRatio = hotRatio
+            )
         }
 
-        val ns = st.copy(
-            shakeCount = shakeCount,
-            lastTime = now,
-            lastX = x, lastY = y, lastZ = z,
-            lastForce = lastForce,
-            lastShake = lastShake,
-            lastSpeed = speed,
-            peakSpeed = maxOf(st.peakSpeed, speed),
-            window = window,
-            hotRatio = hotRatio
-        )
-        return Step(ns, triggered, verdict, speed, shakeCount, ns.peakSpeed, window, hotRatio)
+        fun reset() {
+            queue.clear()
+            lastShakeMs = 0L
+            shakeCount = 0
+            peakMagSq = 0f
+            countedThisBurst = false
+        }
     }
 }

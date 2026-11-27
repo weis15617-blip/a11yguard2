@@ -92,6 +92,88 @@ class MainActivity : AppCompatActivity() {
     private var backTapTest: TextView? = null
     private var shakeTest: TextView? = null
 
+    /** 反馈 QQ 群号。改这里一处，关于页自动同步。 */
+    private val FEEDBACK_QQ_GROUP = "1067815429"
+
+    /**
+     * 震动五档：名称 to 时长（毫秒）。
+     *
+     * 为什么是五档而不是连续可调：
+     *   · 用户真正需要的区分度只有“够轻不吵”到“够强能感知”，五档足够
+     *   · 连续滑杆在小屏上难操作，微调 5ms 差别根本感觉不出来
+     *   · 档位有名字（最弱/中等/最强）比数字直观
+     */
+    /**
+     * 震动档位：名称 / 时长(ms) / 幅度(0-255)。
+     *
+     * ══ 为什么必须同时给幅度 ══
+     *
+     * 只用时长做"轻"是做不到的。VibrationEffect.createOneShot(ms, DEFAULT_AMPLITUDE)
+     * 里 DEFAULT_AMPLITUDE 表示"用最大能力震 ms 毫秒"——时长砍到 15ms 依然是
+     * 一记硬顿击，只是短了点。真正的轻柔必须压幅度。
+     *
+     * 幅度刻度参考 Android Amplitude Scale：
+     *   1-20   羽毛级（贴着皮肤才察觉）
+     *   21-60  轻触
+     *   61-120 中等
+     *   121-180 明显
+     *   181-255 强烈
+     *
+     * 默认用「最弱」= 15ms / 18，接近羽毛感。
+     */
+    private data class VibTier(val name: String, val ms: Int, val amp: Int)
+
+    private val VIB_TIERS: List<VibTier> = listOf(
+        // 幅度刻度按"拿在手里能察觉"为下限来排：
+        //   Android 的 amplitude 0-255 里，1-5 多数设备上几乎无感，
+        //   6-12 是"握持状态能察觉、放桌上听不到"的区间 —— 这就是我们要的下限。
+        VibTier("关闭", 0, 0),
+        VibTier("极轻", 10, 6),      // 最低可感知：握着才有感觉
+        VibTier("羽毛", 14, 12),     // 默认：清晰可察但不打扰
+        VibTier("轻", 25, 30),       // 轻微
+        VibTier("中等", 45, 75),     // 清晰
+        VibTier("最强", 80, 160)     // 强调（没有放到 255，日常用不到那么猛）
+    )
+
+    /** 默认档位索引（最弱）。 */
+    /**
+     * 默认档位 = 「羽毛」（索引 1）。
+     *
+     * 用户明确要求："就要调到最低，拿在手里有感觉就行。"
+     * 所以默认不用「最弱」，直接用最低那一档。
+     */
+    private val VIB_DEFAULT_TIER = 1
+
+    /** 当前音量键（通用）震动时长。 */
+    private fun genVibMsOf(): Int = AppSettings.genVibMs(this)
+
+    /** 某个手势的震动幅度。 */
+    private fun vibAmpOf(kind: String): Int = AppSettings.vibAmp(this, kind)
+
+    /** 某个手势的震动时长。 */
+    private fun vibMsOf(kind: String): Int = AppSettings.vibMs(this, kind, 15)
+
+    /**
+     * 把时长映射回档位名（取最接近的档）。
+     *
+     * 老版本存的是任意毫秒数（30/110/160/200/250），
+     * 直接按档位索引会显示不出来，所以用最近邻映射。
+     */
+    private fun vibTierLabel(ms: Int, amp: Int): String {
+        if (ms <= 0 || amp <= 0) return "关闭"
+        // 按 (时长, 幅度) 的欧氏距离找最近档
+        var best = VIB_TIERS[2]
+        var bestDiff = Double.MAX_VALUE
+        for (tier in VIB_TIERS) {
+            if (tier.ms == 0) continue
+            val dm = (tier.ms - ms).toDouble() / 120.0
+            val da = (tier.amp - amp).toDouble() / 255.0
+            val d = dm * dm + da * da
+            if (d < bestDiff) { bestDiff = d; best = tier }
+        }
+        return best.name
+    }
+
     private val titles = arrayOf("概览", "服务", "手势", "设置", "诊断", "关于")
     private val icons = intArrayOf(
         android.R.drawable.ic_menu_compass,
@@ -182,6 +264,24 @@ class MainActivity : AppCompatActivity() {
      * 现在：页面可见时每 1.2 秒比对一次关键状态，变了就重建当前页。
      * 只在「有变化」时才重建，避免无谓的 View 重绘与焦点跳动（读屏最怕焦点乱跳）。
      */
+    /**
+     * 「选择行」的原地刷新注册表：标题 -> (值 TextView, 取值函数)。
+     *
+     * 为什么需要：selectorRow() 生成 View 时就把 value 写死了。值变了
+     * 只能重建那一行。但重建整页会丢滚动位置 —— 用户滑到第 10 项点一下，
+     * 界面跳回顶部，得重新滑下来。所以只更新那一行文字。
+     */
+    private val rowRefreshers = LinkedHashMap<String, () -> Unit>()
+
+    /** 清空注册表（页面重建时调用，避免累积已销毁的 View 引用）。 */
+    private fun clearRowRefreshers() = rowRefreshers.clear()
+
+    /** 原地刷新所有选择行（不重建页面、不动滚动位置）。 */
+    private fun refreshRowsInPlace() {
+        if (rowRefreshers.isEmpty()) return
+        rowRefreshers.values.forEach { it() }
+    }
+
     private val stateWatcher = object : Runnable {
         override fun run() {
             if (!isResumed) return
@@ -246,6 +346,13 @@ class MainActivity : AppCompatActivity() {
     private fun invalidateCurrentPage() {
         // 保护：如果用户正在跟某个输入框/对话框交互，不要重建（会打断输入与读屏焦点）
         if (isUserInteracting()) return
+
+        // ══ 保存滚动位置 ══
+        // 重建会生成新的 ScrollView，位置自然是 0 —— 用户滑到第 10 项点一下，
+        // 界面直接弹回顶部，得重新滑下来（实测切换十几次就受不了）。
+        // 所以重建后必须把位置写回去。
+        val savedScroll = currentPageScrollY()
+
         pages[current] = null
         val page = buildPage(current).also { pages[current] = it }
         content.removeAllViews()
@@ -255,7 +362,34 @@ class MainActivity : AppCompatActivity() {
             bindBackTapTest()
         }
         if (::diagBody.isInitialized) runCatching { diagBody.text = Diag.dump() }
-        Diag.log("ui", "页面 ${current} 因状态变化重建")
+        // 恢复滚动位置：等一帧让布局完成，否则 scrollTo 会被后续 layout 覆盖
+        if (savedScroll > 0) {
+            val sv = currentScrollView()
+            sv?.post { sv.scrollTo(0, savedScroll) }
+        }
+        Diag.log("ui", "页面 ${current} 重建（滚动恢复至 $savedScroll）")
+    }
+
+    /** 取当前页 ScrollView 的滚动位置；没有则 0。 */
+    private fun currentPageScrollY(): Int {
+        val sv = currentScrollView() ?: return 0
+        return sv.scrollY
+    }
+
+    /** 找当前页最外层的 ScrollView。 */
+    private fun currentScrollView(): ScrollView? {
+        for (i in 0 until content.childCount) {
+            val v = content.getChildAt(i)
+            if (v is ScrollView) return v
+            // 有些页面外面包了一层容器
+            if (v is android.view.ViewGroup) {
+                for (j in 0 until v.childCount) {
+                    val c = v.getChildAt(j)
+                    if (c is ScrollView) return c
+                }
+            }
+        }
+        return null
     }
 
     override fun onResume() {
@@ -344,10 +478,15 @@ class MainActivity : AppCompatActivity() {
         // 切页时把目标页作废重建：保证每次进入页面看到的都是最新配置，
         // 而不是"上次打开时缓存的旧值"。
         if (current != i) pages[i] = null
+        val isSamePage = (current == i)
+        val savedScroll2 = if (isSamePage) currentPageScrollY() else 0
         current = i
         val page = pages[i] ?: buildPage(i).also { pages[i] = it }
         content.removeAllViews()
         content.addView(page)
+        if (savedScroll2 > 0) {
+            currentScrollView()?.post { currentScrollView()?.scrollTo(0, savedScroll2) }
+        }
         if (i == 2) {
             BackTapRuntime.acquire(this, BackTapRuntime.OWNER_TEST)
             bindBackTapTest()
@@ -1103,11 +1242,10 @@ class MainActivity : AppCompatActivity() {
                     pickOption(
                         "摇动过程中的弱震动时长（尽量短，才能与成功震动区分）",
                         listOf(
-                            "8" to "极短（8ms）",
-                            "12" to "很短（12ms）",
-                            "15" to "短（15ms，默认）",
-                            "25" to "中（25ms）",
-                            "40" to "较长（40ms）"
+                            "8" to "毛羽（8ms）",
+                            "12" to "很轻（12ms，默认）",
+                            "18" to "轻（18ms）",
+                            "28" to "中（28ms）"
                         ),
                         AppSettings.shakeTickVibMs(this).toString()
                     ) { v ->
@@ -1131,13 +1269,15 @@ class MainActivity : AppCompatActivity() {
             ll.addView(cardWrap(shakeTestTv))
         }
 
-        // ── 震动：每个手势独立开关 + 独立时长 ──
+        // ══════════ 震动 ══════════
         //
-        // 分三类而不是一个总开关，因为触发频率差很多：
-        //   音量键：手动触发，偶尔
-        //   背面敲击：含"计入中间次数"的提示，中等
-        //   摇一摇：甩动时连续触发，最吵
-        // 有人要音量键有反馈但摇一摇安静，共用一个开关做不到。
+        // 用**折叠面板**而不是给每个手势来一行下拉：
+        //   展开后三大类手势的档位一目了然，点一下就能换
+        //   收起时只占一行，不把页面撑长
+        //   默认档位是「最弱」，符合"有反馈但不吵"的默认期待
+        ll.addView(sectionTitle("震动反馈"))
+
+        // ── 总闸：一键全关 ──
         val vibAllSw = MaterialSwitch(this).apply {
             text = "关闭所有震动"
             textSize = 14f
@@ -1152,63 +1292,126 @@ class MainActivity : AppCompatActivity() {
         }
         ll.addView(cardWrap(vibAllSw))
 
+        // 成功震动单独一个开关：有人只要过程反馈不要成功震动，或反之。
+        // 默认开启 —— 触发成功给一声确认，这是绝大多数人的期待。
+        val vibSuccessSw = MaterialSwitch(this).apply {
+            text = "触发成功时震动"
+            textSize = 14f
+            setTextColor(Color.parseColor(if (AppSettings.vibAllOff(this@MainActivity)) SUB else TEXT))
+            isChecked = AppSettings.vibOnSuccess(this@MainActivity)
+            isEnabled = !AppSettings.vibAllOff(this@MainActivity)
+            isFocusable = true
+            setOnCheckedChangeListener { _, v ->
+                prefs.edit().putBoolean("vib_on_success", v).apply()
+                Diag.log("setting", "vib_on_success=$v")
+                window.decorView.post { invalidateCurrentPage() }
+            }
+        }
+        ll.addView(cardWrap(vibSuccessSw))
+
         val allOff = AppSettings.vibAllOff(this)
-        if (allOff) {
-            ll.addView(hint("已全局关闭震动。下面三项的独立设置暂不生效，手势本身仍正常工作。"))
+
+        // ── 折叠容器 ──
+        val vibExpanded = prefs.getBoolean("ui_vib_expanded", false)
+        val vibSummary = if (allOff) {
+            "已全部关闭"
+        } else {
+            val s = mutableListOf<String>()
+            if (AppSettings.vibOn(this, AppSettings.VIB_VOL)) s.add("音量键 " + vibTierLabel(genVibMsOf(), vibAmpOf(AppSettings.VIB_VOL)))
+            if (AppSettings.vibOn(this, AppSettings.VIB_TAP)) s.add("敲击 " + vibTierLabel(vibMsOf(AppSettings.VIB_TAP), vibAmpOf(AppSettings.VIB_TAP)))
+            if (AppSettings.vibOn(this, AppSettings.VIB_SHAKE)) s.add("摇一摇 " + vibTierLabel(vibMsOf(AppSettings.VIB_SHAKE), vibAmpOf(AppSettings.VIB_SHAKE)))
+            if (s.isEmpty()) "全部关闭" else s.joinToString(" · ")
         }
 
-        // 三类各自的开关与时长
-        listOf(
-            Triple(AppSettings.VIB_VOL, "音量键震动", "双击/三击音量键时的反馈"),
-            Triple(AppSettings.VIB_TAP, "背面敲击震动", "敲击计数与触发时的反馈"),
-            Triple(AppSettings.VIB_SHAKE, "摇一摇震动", "甩动触发时的反馈")
-        ).forEach { (kind, label, desc) ->
-            val sw = MaterialSwitch(this).apply {
-                text = label
-                textSize = 14f
-                setTextColor(Color.parseColor(if (allOff) SUB else TEXT))
-                isChecked = AppSettings.vibOn(this@MainActivity, kind) && !allOff
-                isEnabled = !allOff
-                isFocusable = true
-                setOnCheckedChangeListener { _, v ->
-                    AppSettings.setVibOn(this@MainActivity, kind, v)
-                    Diag.log("setting", "vib_$kind=$v")
-                    window.decorView.post { invalidateCurrentPage() }
-                }
-            }
-            ll.addView(cardWrap(sw))
+        ll.addView(cardWrap(selectorRow(
+            if (vibExpanded) "震动档位 ▲" else "震动档位 ▼",
+            vibSummary
+        ) {
+            prefs.edit().putBoolean("ui_vib_expanded", !vibExpanded).apply()
+            window.decorView.post { invalidateCurrentPage() }
+        }))
 
-            val curMs = if (kind == AppSettings.VIB_VOL) {
-                AppSettings.genVibMs(this)
-            } else {
-                AppSettings.vibMs(this, kind, 35)
-            }
-            ll.addView(cardWrap(selectorRow(
-                "$label · 时长",
-                vibLabelFor(curMs, kind)
-            ) {
-                pickOption(
-                    desc,
-                    listOf(
-                        "0" to "关闭（不震动）",
-                        "15" to "极轻（15ms）",
-                        "30" to "很轻（30ms）",
-                        "60" to "轻（60ms）",
-                        "110" to "中（110ms）",
-                        "160" to "标准（160ms）",
-                        "200" to "较强（200ms）",
-                        "250" to "强（250ms）"
-                    ),
-                    curMs.toString()
-                ) { v ->
-                    if (kind == AppSettings.VIB_VOL) {
-                        prefs.edit().putInt("gen_vib", v.toInt()).apply()
-                    } else {
-                        AppSettings.setVibMs(this@MainActivity, kind, v.toInt())
+        if (vibExpanded) {
+            val triple = listOf(
+                Triple(AppSettings.VIB_VOL, "音量键", "双击上/下键触发时"),
+                Triple(AppSettings.VIB_TAP, "背面敲击", "敲击计数与触发时"),
+                Triple(AppSettings.VIB_SHAKE, "摇一摇", "甩动触发时")
+            )
+            triple.forEach { (kind, label, desc) ->
+                val curMs = if (kind == AppSettings.VIB_VOL) genVibMsOf() else vibMsOf(kind)
+                val on = AppSettings.vibOn(this, kind) && !allOff
+
+                // 开关
+                val sw = MaterialSwitch(this).apply {
+                    text = label + "　·　" + desc
+                    textSize = 14f
+                    setTextColor(Color.parseColor(if (allOff) SUB else TEXT))
+                    isChecked = on
+                    isEnabled = !allOff
+                    isFocusable = true
+                    setOnCheckedChangeListener { _, v ->
+                        AppSettings.setVibOn(this@MainActivity, kind, v)
+                        Diag.log("setting", "vib_$kind=$v")
+                        window.decorView.post { invalidateCurrentPage() }
                     }
-                    show(2)
                 }
-            }))
+                ll.addView(cardWrap(sw))
+
+                // 五档按钮行
+                val tierRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(dp(10), dp(8), dp(10), dp(8))
+                }
+                val curAmp = vibAmpOf(kind)
+                VIB_TIERS.forEach { tier ->
+                    val name = tier.name
+                    val selected = (curMs == tier.ms && curAmp == tier.amp)
+                    tierRow.addView(TextView(this).apply {
+                        text = name
+                        textSize = 12f
+                        gravity = android.view.Gravity.CENTER
+                        setTextColor(
+                            Color.parseColor(if (selected) "#0E1215" else if (allOff || !on) SUB else TEXT)
+                        )
+                        typeface = Typeface.create(
+                            if (selected) "sans-serif-medium" else "sans-serif", Typeface.NORMAL
+                        )
+                        val padH = dp(4); val padV = dp(7)
+                        setPadding(padH, padV, padH, padV)
+                        background = android.graphics.drawable.GradientDrawable().apply {
+                            cornerRadius = dp(10).toFloat()
+                            setColor(
+                                when {
+                                    selected -> Color.parseColor(GREEN)
+                                    else -> Color.parseColor(CARD2)
+                                }
+                            )
+                        }
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                            .apply { marginStart = dp(3); marginEnd = dp(3) }
+                        isClickable = true
+                        isFocusable = true
+                        contentDescription = "$label 震动档位 $name"
+                        setOnClickListener {
+                            // 时长和幅度同时写：只写时长的话，"轻"只体现为"短"，手感依然硬
+                            if (kind == AppSettings.VIB_VOL) {
+                                prefs.edit().putInt("gen_vib", tier.ms).apply()
+                            } else {
+                                AppSettings.setVibMs(this@MainActivity, kind, tier.ms)
+                            }
+                            AppSettings.setVibAmp(this@MainActivity, kind, tier.amp)
+                            AppSettings.setVibOn(this@MainActivity, kind, tier.ms > 0)
+                            Diag.log("setting", "vib_$kind=${tier.ms}ms amp=${tier.amp}")
+                            window.decorView.post { invalidateCurrentPage() }
+                        }
+                    })
+                }
+                ll.addView(cardWrap(tierRow))
+            }
+            ll.addView(hint(
+                "档位说明：「最弱」几乎无感、「中等」清晰可辨、「最强」用力震动。"
+                    + "每一类手势都可以单独设档，也可以单独关掉。"
+            ))
         }
 
         ll.addView(sectionTitle("背面敲击"))
@@ -1405,7 +1608,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             val verdict = when {
                 ev.triggered -> "判定成功，已触发切换"
-                ev.accepted -> "计入 ${ev.count}/${ev.need}"
+                ev.accepted -> "计入 ${ev.taps}/${ev.need}"
                 else -> "未计入（${ev.reason}）"
             }
             sb.append("\n最近一次：峰值 %.2f m/s² · %s".format(ev.peak, verdict))
@@ -1423,17 +1626,19 @@ class MainActivity : AppCompatActivity() {
     private fun backTapSensitivityLabel(): String {
         val lv = AppSettings.backTapSensitivity(this)
         val p = BackTapLogic.paramsForSensitivity(lv)
-        return "$lv / 10 · 阈值 %.1f · 间隔 %d–%dms".format(
-            p.ampThreshold, BackTapLogic.MIN_GAP_MS, p.maxGapMs
-        )
+        // 显示噪声门限而不是"振幅阈值"：Columbus 算法判的是**峰值形态**
+        // （正峰位置 + 负峰配对），不是单一阈值。noise 是唯一可调的灵敏度旋钮。
+        return "$lv / 10 · 噪声门限 %.3f".format(p.minNoise)
     }
 
     private fun backTapLevelText(level: Int): String {
         val p = BackTapLogic.paramsForSensitivity(level)
-        return ("$level / 10 · 振幅阈值 %.1f m/s²\n"
-            + "相邻间隔 %.0f–%dms · 整串上限 %dms · 置信度 %.2f").format(
-            p.ampThreshold, BackTapLogic.MIN_GAP_MS.toFloat(), p.maxGapMs,
-            BackTapLogic.MAX_COMBO_SPAN_MS, p.minConfidence
+        return ("$level / 10 · 噪声门限 %.3f\n"
+            + "双击间隔 %d–%dms · 峰值窗口 %d").format(
+            p.minNoise,
+            BackTapLogic.MIN_TAP_GAP_NS / 1_000_000L,
+            BackTapLogic.MAX_TAP_GAP_NS / 1_000_000L,
+            p.peakWindow
         )
     }
 
@@ -1750,6 +1955,57 @@ class MainActivity : AppCompatActivity() {
         }
         ll.addView(cardWrap(updateSw))
 
+        // ══════════ 语音控制 ══════════
+        ll.addView(sectionTitle("语音控制"))
+        ll.addView(hint(
+            "把本应用设为系统「辅助应用」后，长按 Home 键（或原来的语音助手手势）"
+                + "就能唤起语音页，说关键词即可切换服务。"
+        ))
+
+        ll.addView(cardWrap(clickRow("打开语音控制页") {
+            runCatching {
+                startActivity(android.content.Intent(this, VoiceActivity::class.java))
+            }.onFailure { toast("无法打开语音页：" + (it.message ?: "")) }
+        }))
+        ll.addView(cardWrap(clickRow("编辑语音关键词") { editVoiceKeywords() }))
+
+        // ── 助手界面触发 ──
+        //
+        // 国内环境下这是最实用的一条路：不依赖识别器能否联网，
+        // 只要手机的语音助手本身能用，就能通过它的界面读关键词。
+        val assistSw = MaterialSwitch(this).apply {
+            text = "用系统语音助手触发"
+            textSize = 14f
+            setTextColor(Color.parseColor(TEXT))
+            isChecked = AppSettings.assistantBridgeOn(this@MainActivity)
+            isFocusable = true
+            setOnCheckedChangeListener { _, v ->
+                AppSettings.setAssistantBridgeOn(this@MainActivity, v)
+                Diag.log("setting", "assistant_bridge=$v")
+                window.decorView.post { invalidateCurrentPage() }
+            }
+        }
+        ll.addView(cardWrap(assistSw))
+        ll.addView(hint(
+            "开启后，对手机自带的语音助手说关键词（如「关闭解说」），"
+                + "本应用会读取助手界面上出现的文字并执行切换。"
+        ))
+        ll.addView(hint(
+            "原理：Android 不允许第三方直接拿助手的识别结果，"
+                + "但助手必须把结果显示在屏幕上 —— 本应用是无障碍服务，能读到那段文字。"
+        ))
+        if (AppSettings.assistantBridgeOn(this)) {
+            ll.addView(cardWrap(clickRow("编辑要监听的助手包名") { editAssistantPkgs() }))
+            ll.addView(hint(
+                "只在这些包名的界面里匹配关键词。默认已包含小布、小爱、vivo、"
+                    + "Google 助手等。如果你的助手不在列表里，把它的包名加进去。"
+            ))
+        }
+        ll.addView(hint(
+            "格式：每行一条「关键词|动作」。动作可以是组件名（切换）"
+                + "或 ensure:组件名（确保开启）。识别不准时多写几个同义词。"
+        ))
+
         ll.addView(cardWrap(selectorRow("更新源", updateSourceLabel()) {
             editUpdateSource()
         }))
@@ -1979,12 +2235,26 @@ class MainActivity : AppCompatActivity() {
         val ll = column()
         ll.addView(sectionTitle("无障碍守护"))
         ll.addView(TextView(this).apply {
-            text = "包名：com.merin.a11yguard2\n版本：1.5.0（versionCode 6）\n" +
+            // 版本号从 BuildConfig 读，别再写死 —— 之前写死的 1.5.0 一直没跟着
+            // versionName 更新，用户看关于页会以为装的是旧版。
+            text = "包名：com.merin.a11yguard2\n" +
+                "版本：${BuildConfig.VERSION_NAME}（versionCode ${BuildConfig.VERSION_CODE}）\n" +
                 "执行层：自动（WRITE_SECURE_SETTINGS 直写 → Shizuku → 点按）\n" +
                 "保活：前台服务 + 15 分钟自检 + 开机补启"
             textSize = 13f
             setTextColor(Color.parseColor(TEXT))
         })
+
+        // ── 反馈渠道 ──
+        // 放在最前面而不是页面底部：用户遇到问题时最先想找的就是"去哪反馈"。
+        ll.addView(sectionTitle("反馈与交流"))
+        ll.addView(cardWrap(clickRow("加入 QQ 群反馈：${FEEDBACK_QQ_GROUP}") {
+            copyText(FEEDBACK_QQ_GROUP, "群号已复制，打开 QQ 粘贴搜索即可加入")
+        }))
+        ll.addView(hint(
+            "遇到问题请先到「诊断」页复制日志再反馈，日志里有关键运行信息，" +
+                "能大幅加快定位速度。"
+        ))
         ll.addView(sectionTitle("技术事实"))
         listOf(
             "WRITE_SECURE_SETTINGS 是 signature|privileged 权限，普通安装拿不到；用一次 adb shell pm grant 授予后由系统按包保存，重启手机仍有效，卸载重装后才需重新授权。",
@@ -2179,6 +2449,80 @@ class MainActivity : AppCompatActivity() {
      * 给无障碍服务起中文别名（比如「一号」「二号」），因为语音识别对英文服务名
      * 的准确率很低，改成短中文名之后说「开启一号」就能稳定命中。
      */
+    /**
+     * 编辑语音关键词。
+     *
+     * 用多行文本框而不是逐条列表：关键词可能很多（每个服务至少四条），
+     * 逐条增删太繁琐；一次性编辑整块文本最快，也方便复制备份。
+     */
+    /** 编辑要监听的助手包名。 */
+    private fun editAssistantPkgs() {
+        val box = EditText(this).apply {
+            setText(AppSettings.assistantPkgsRaw(this@MainActivity))
+            hint = "com.heytap.speechassist"
+            setSingleLine(false)
+            minLines = 6
+            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            textSize = 13f
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("要监听的助手包名")
+            .setMessage(
+                "每行一个包名。留空并保存 = 恢复默认列表。\n\n"
+                    + "常用：\n"
+                    + "com.heytap.speechassist（OPPO 小布）\n"
+                    + "com.miui.voiceassist（小米小爱）\n"
+                    + "com.vivo.abe（vivo）\n"
+                    + "com.google.android.googlequicksearchbox（Google）"
+            )
+            .setView(box)
+            .setPositiveButton("保存") { _, _ ->
+                AppSettings.setAssistantPkgsRaw(this, box.text.toString())
+                toast("已保存 ${AppSettings.assistantPkgs(this).size} 个包名")
+            }
+            .setNeutralButton("恢复默认") { _, _ ->
+                AppSettings.setAssistantPkgsRaw(this, "")
+                toast("已恢复默认")
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+        private fun editVoiceKeywords() {
+        val box = EditText(this).apply {
+            setText(AppSettings.voiceKeywordsRaw(this@MainActivity))
+            hint = "开启解说|ensure:com.pkg/com.pkg.Service"
+            setSingleLine(false)
+            minLines = 8
+            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            textSize = 13f
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("语音关键词")
+            .setMessage(
+                "每行一条「关键词|动作」，例如：\n"
+                    + "开启解说|ensure:com.nirenr.talkman/...TalkManAccessibilityService\n"
+                    + "关闭解说|com.nirenr.talkman/...TalkManAccessibilityService\n\n"
+                    + "留空并保存 = 恢复默认"
+            )
+            .setView(box)
+            .setPositiveButton("保存") { _, _ ->
+                AppSettings.setVoiceKeywordsRaw(this, box.text.toString())
+                val n = AppSettings.voiceKeywords(this).size
+                toast("已保存 $n 条关键词")
+            }
+            .setNeutralButton("恢复默认") { _, _ ->
+                AppSettings.setVoiceKeywordsRaw(this, "")
+                toast("已恢复默认关键词")
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
     private fun editAlias(comp: String, fallback: String) {
         val cur = AppSettings.aliasMap(this)[SvcRepo.normalize(comp)].orEmpty()
         val box = EditText(this).apply {
@@ -2193,12 +2537,16 @@ class MainActivity : AppCompatActivity() {
             .setView(box)
             .setPositiveButton("保存") { _, _ ->
                 AppSettings.setAlias(this, comp, box.text.toString())
-                refreshState()
-                toast("已保存")
+                // 必须重建当前页：服务列表和所有「目标服务」行的文字
+                // 都是 buildPage() 时用 aliasOf 取的字符串，已固化在 View 里。
+                // 只调 refreshState() 的话，那些行仍显示旧名。
+                // invalidateCurrentPage 内部会保持滚动位置，不会跳回顶部。
+                window.decorView.post { invalidateCurrentPage() }
+                toast("已保存：${AppSettings.aliasOf(this, comp, fallback)}")
             }
             .setNeutralButton("恢复原名") { _, _ ->
                 AppSettings.setAlias(this, comp, "")
-                refreshState()
+                window.decorView.post { invalidateCurrentPage() }
                 toast("已恢复原名")
             }
             .setNegativeButton("取消", null)
@@ -2220,7 +2568,19 @@ class MainActivity : AppCompatActivity() {
      *   · 16dp 圆角、Material 3 表面色
      *   · contentDescription 保持「标题，当前 值」，读屏逻辑不变
      */
-    private fun selectorRow(title: String, value: String, onClick: () -> Unit): MaterialCardView =
+    /**
+     * 一行「标题 + 当前值」的可点卡片。
+     *
+     * @param value 初次显示的值
+     * @param valueProvider 可选：刷新时重新取值的函数。传了就会登记到
+     *        rowRefreshers，之后 pickOption 选完只更新这一行，不重建整页。
+     */
+    private fun selectorRow(
+        title: String,
+        value: String,
+        valueProvider: (() -> String)? = null,
+        onClick: () -> Unit
+    ): MaterialCardView =
         MaterialCardView(this).apply {
             layoutParams = ViewGroup.MarginLayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -2241,12 +2601,23 @@ class MainActivity : AppCompatActivity() {
                     typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                     setTextColor(Color.parseColor(TEXT))
                 })
-                addView(TextView(this@MainActivity).apply {
+                val valueTv = TextView(this@MainActivity).apply {
                     text = value
                     textSize = 13f
                     setTextColor(Color.parseColor(SUB))
                     setPadding(0, dp(3), 0, 0)
-                })
+                }
+                addView(valueTv)
+                // 登记原地刷新：只有调用方提供了取值函数才登记
+                if (valueProvider != null) {
+                    rowRefreshers[title] = {
+                        val nv = valueProvider()
+                        if (valueTv.text.toString() != nv) {
+                            valueTv.text = nv
+                            contentDescription = "$title，当前 $nv"
+                        }
+                    }
+                }
             })
             setOnClickListener { onClick() }
         }
@@ -2270,8 +2641,10 @@ class MainActivity : AppCompatActivity() {
             .setSingleChoiceItems(options.map { it.second }.toTypedArray(), idx) { d, which ->
                 onPick(options[which].first)
                 d.dismiss()
-                // 延迟一帧：让对话框先关掉，再重建页面，避免焦点错乱
-                window.decorView.post { invalidateCurrentPage() }
+                // 只刷新选择行的文字，不重建页面。
+                // 早期这里调 invalidateCurrentPage() 整页重建，导致
+                // 用户滑到下面点一下就被弹回顶部，得重新滑回来。
+                window.decorView.post { refreshRowsInPlace() }
             }
             .setNegativeButton("取消", null)
             .show()

@@ -16,14 +16,71 @@ object Triggers {
      *   2. 全局总开关关闭
      *   3. 该功能的独立开关关闭
      */
-    fun vibrate(ctx: Context, ms: Int, kind: String = AppSettings.VIB_VOL) {
+    /**
+     * 触觉反馈。**时长和幅度分别控制**。
+     *
+     * ── 为什么必须调幅度（踩过的坑）──
+     *
+     * 早期只传时长、幅度用 VibrationEffect.DEFAULT_AMPLITUDE，
+     * 而 DEFAULT_AMPLITUDE 的语义是"用设备最大能力震这么久"。
+     * 结果是把时长砍到 15ms 后，手感依然是一记**很硬的顿击** ——
+     * 短促但没有变轻。用户的原话是"应该是那种轻如羽毛"。
+     *
+     * 真正的轻柔必须同时压低幅度：8/255 大约是"贴在手上能察觉"的量级。
+     *
+     * @param ms       震动时长（毫秒）
+     * @param kind     功能类别（决定独立开关）
+     * @param amplitude 幅度 0-255。0 = 不震，8 = 羽毛级，255 = 最强
+     */
+    fun vibrate(
+        ctx: Context,
+        ms: Int,
+        kind: String = AppSettings.VIB_VOL,
+        amplitude: Int = AppSettings.DEFAULT_AMPLITUDE
+    ) {
         if (ms <= 0) return
+        if (amplitude <= 0) return
         if (!AppSettings.vibOn(ctx, kind)) return
         runCatching {
             val v = ctx.getSystemService(Vibrator::class.java) ?: return
             if (!v.hasVibrator()) return
-            if (Build.VERSION.SDK_INT >= 26) {
-                v.vibrate(VibrationEffect.createOneShot(ms.toLong(), VibrationEffect.DEFAULT_AMPLITUDE))
+
+            if (Build.VERSION.SDK_INT >= 27) {
+                // ── 优先用系统预定义效果 ──
+                //
+                // createPredefined 的效果在 HAL 层由厂商调优，直接驱动马达的
+                // 瞬态响应，比应用层拼波形自然得多：
+                //
+                //   EFFECT_CLICK   干脆的"嗒"（默认，最接近"轻点一下"）
+                //   EFFECT_TICK    更轻的"嘀"
+                //   EFFECT_HEAVY_CLICK 重的"嗒"
+                //
+                // 之前试过 createOneShot（方波，听感"嗡"）和
+                // createWaveform（带尾巴，仍有拖音），都不如这个干脆。
+                val effect = when {
+                    amplitude <= 12 -> VibrationEffect.EFFECT_TICK      // 极轻
+                    amplitude <= 60 -> VibrationEffect.EFFECT_CLICK     // 轻/中
+                    else -> VibrationEffect.EFFECT_HEAVY_CLICK          // 强
+                }
+                runCatching {
+                    v.vibrate(VibrationEffect.createPredefined(effect))
+                }.onFailure {
+                    // 少数设备不支持预定义效果，退回单次短震
+                    v.vibrate(
+                        VibrationEffect.createOneShot(
+                            ms.toLong().coerceAtLeast(10L),
+                            amplitude.coerceIn(1, 255)
+                        )
+                    )
+                }
+            } else if (Build.VERSION.SDK_INT >= 26) {
+                // API 26：没有 createPredefined，用短促单次震动
+                v.vibrate(
+                    VibrationEffect.createOneShot(
+                        ms.toLong().coerceAtLeast(10L),
+                        amplitude.coerceIn(1, 255)
+                    )
+                )
             } else {
                 @Suppress("DEPRECATION")
                 v.vibrate(ms.toLong())
@@ -81,7 +138,8 @@ object Triggers {
             val res = ToggleRouter.toggle(ctx, target, true)
             AppSettings.bumpStat(ctx, res.ok)
             Diag.log(source, "ensure ${res.logLine()}")
-            if (res.ok) vibrate(ctx, AppSettings.genVibMs(ctx))
+            // 同上：ensure 是锁屏/解锁这类周期性动作，不该额外震。
+            // 用户正在听书时被震一下反而打断。
         }.start()
     }
 
@@ -96,7 +154,11 @@ object Triggers {
             val res = ToggleRouter.toggle(ctx, comp, want)
             AppSettings.bumpStat(ctx, res.ok)
             Diag.log(source, "want=$want ${res.logLine()}")
-            vibrate(ctx, AppSettings.genVibMs(ctx))
+            // 注意：这里**不震**。
+            //
+            // 手势层（BackTapWatcher / ShakeWatcher）已经在触发的瞬间震过了，
+            // 这里再震一次会形成"咚咚"两声（间隔几十毫秒），听感晃晃悠悠。
+            // 震动统一由手势层负责，执行层静默。
         }.start()
     }
 
@@ -128,6 +190,7 @@ object Triggers {
         }
 
         when {
+
             a.isEmpty() || a == AppSettings.ACT_NONE -> Unit
             a == AppSettings.ACT_MASTER -> {
                 if (!SvcRepo.isEnabled(ctx, GuardA11yService.COMP)) {
