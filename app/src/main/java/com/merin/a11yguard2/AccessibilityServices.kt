@@ -149,12 +149,19 @@ class TapAgentService : AccessibilityService() {
             private set
     }
 
+    private var shake: ShakeWatcher? = null
     private var screenReceiver: BroadcastReceiver? = null
 
     private var upCount = 0
+    private var upFirst = 0L      // 手势序列第一下（窗口起点，按"总时长"语义）
     private var upLast = 0L
+    private var upRapid = 0       // 快速连按次数（用于"调音量"判定，独立窗口）
+    private var upRapidFirst = 0L
     private var downCount = 0
+    private var downFirst = 0L
     private var downLast = 0L
+    private var downRapid = 0
+    private var downRapidFirst = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -168,6 +175,23 @@ class TapAgentService : AccessibilityService() {
         resetGestureCounters()
         BackTapRuntime.acquire(this, BackTapRuntime.OWNER_TAPAGENT)
         registerScreenReceiver()
+    }
+
+    /** 设置页改动摇一摇参数后调用。 */
+    fun reloadShake() {
+        shake?.stop()
+        shake = null
+        startShake()
+    }
+
+    private fun startShake() {
+        shake?.stop()
+        shake = null
+        val w = ShakeWatcher(this) {
+            Triggers.runAction(this, AppSettings.shakeTarget(this), "shake")
+        }
+        shake = w
+        w.start()
     }
 
     private fun registerScreenReceiver() {
@@ -209,41 +233,87 @@ class TapAgentService : AccessibilityService() {
      * 用户调音量时通常连按 3–5 下，若第二下就触发，几乎每次调音量都会误触发手势。
      * 现在按到第 3 下即判定为调音量并取消；只有恰好两下才在确认期后触发。
      */
+    /**
+     * 音量键判定。
+     *
+     * ══ 与「调音量」的冲突，靠三层机制隔离 ══
+     *
+     * 1. **上下键互斥**：同一序列里混按上/下 = 用户在调音量（想大声又嫌太大声），
+     *    两个序列一起作废。真手势不会上下混按。
+     *
+     * 2. **连按上限**：按到第 4 下判为调音量，整串作废（见 KeyPressLogic.MAX_COMBO）。
+     *
+     * 3. **确认期**：第 2 下不立即执行，等 win 毫秒看有没有第 3 下。
+     *    调音量的人通常会在确认期内继续按第 4 下 → 被第 2 条拦掉。
+     *
+     * 另外始终 `return false`，不消费按键 —— 系统音量照常调节，
+     * 手势只是在"顺手"判断，绝不阻止用户改音量。
+     */
     override fun onKeyEvent(event: KeyEvent): Boolean {
         if (event.action != KeyEvent.ACTION_DOWN) return false
         // 总开关关闭时：不仅不响应，还要清掉可能残留的计数与待触发任务。
-        // 否则「双击一下 → 立刻关开关」的情况下，已排队的确认任务仍会在 220ms 后执行。
+        // 否则「双击一下 → 立刻关开关」的情况下，已排队的确认任务仍会延迟执行。
         if (!AppSettings.volKeyOn(this)) {
             if (upCount != 0 || downCount != 0) resetGestureCounters()
             return false
         }
         val now = SystemClock.uptimeMillis()
         val win = AppSettings.volWindowMs(this)
+
         when (event.keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> {
-                val target = AppSettings.volUpTarget(this)
-                if (target.isEmpty() || sameComp(target)) return false
-                val r = KeyPressLogic.press(upCount, upLast, now, win)
+                // 只要「双击或三击」任一目标有效就响应。
+                // 早期版本要求双击目标必须非空，导致「只配了三击」时完全不响应。
+                val dbl = AppSettings.volUpTarget(this)
+                val triple = AppSettings.volUpTripleTarget(this)
+                if ((dbl.isEmpty() || sameComp(dbl)) && (triple.isEmpty() || sameComp(triple)))
+                    return false
+                // ↓ 互斥：下键序列还在进行中就说明在调音量
+                if (downCount > 0 && now - downFirst < KeyPressLogic.VOLUME_WINDOW_MS) {
+                    Diag.log("volkey", "上下混按 → 判为调音量，两个序列都作废")
+                    resetGestureCounters()
+                    return false
+                }
+                val r = KeyPressLogic.press(
+                    upCount, upFirst, upLast, now, win, upRapid, upRapidFirst
+                )
                 upCount = r.count
+                upFirst = r.firstTs
                 upLast = r.lastTs
+                upRapid = r.rapidCount
+                upRapidFirst = r.rapidFirst
                 if (r.cancelled) {
-                    Diag.log("volkey", "UP 连按 ${KeyPressLogic.CONFIRM_MS}ms 内达 3 次 → 判为调音量，取消")
+                    Diag.log("volkey", "UP 连按达 ${KeyPressLogic.MAX_COMBO} 次 → 判为调音量，取消")
                     cancelPending(Pending.UP)
                 } else if (r.pendingFire) {
-                    scheduleConfirm(Pending.UP, target)
+                    // 等待时间 = 窗口剩余量（保证整串总耗时不超过设定值）
+                    scheduleConfirm(Pending.UP, dbl, triple, r.waitMs)
                 }
             }
             KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                val target = AppSettings.volDownTarget(this)
-                if (target.isEmpty() || sameComp(target)) return false
-                val r = KeyPressLogic.press(downCount, downLast, now, win)
+                val dbl = AppSettings.volDownTarget(this)
+                val triple = AppSettings.volDownTripleTarget(this)
+                if ((dbl.isEmpty() || sameComp(dbl)) && (triple.isEmpty() || sameComp(triple)))
+                    return false
+                // ↓ 互斥：上键序列还在进行中就说明在调音量
+                if (upCount > 0 && now - upFirst < KeyPressLogic.VOLUME_WINDOW_MS) {
+                    Diag.log("volkey", "上下混按 → 判为调音量，两个序列都作废")
+                    resetGestureCounters()
+                    return false
+                }
+                val r = KeyPressLogic.press(
+                    downCount, downFirst, downLast, now, win, downRapid, downRapidFirst
+                )
                 downCount = r.count
+                downFirst = r.firstTs
                 downLast = r.lastTs
+                downRapid = r.rapidCount
+                downRapidFirst = r.rapidFirst
                 if (r.cancelled) {
-                    Diag.log("volkey", "DOWN 连按 3 次 → 判为调音量，取消")
+                    Diag.log("volkey", "DOWN 连按达 ${KeyPressLogic.MAX_COMBO} 次 → 判为调音量，取消")
                     cancelPending(Pending.DOWN)
                 } else if (r.pendingFire) {
-                    scheduleConfirm(Pending.DOWN, target)
+                    scheduleConfirm(Pending.DOWN, dbl, triple, r.waitMs)
                 }
             }
         }
@@ -252,7 +322,7 @@ class TapAgentService : AccessibilityService() {
 
     /**
      * 音量键开关状态变化时调用（设置页切换开关后）。
-     * 关闭时清空计数与待触发任务，确保不会残留一次「幽灵双击」。
+     * 关闭时清空计数与待触发任务，确保不会残留一次「幽灵触发」。
      */
     fun onVolKeySwitchChanged() {
         if (!AppSettings.volKeyOn(this)) {
@@ -266,27 +336,53 @@ class TapAgentService : AccessibilityService() {
 
     private val pendingRunnable = HashMap<Pending, Runnable>()
 
-    /** 安排一次「确认期后触发」；同键重复按下会覆盖前一次的待触发。 */
-    private fun scheduleConfirm(which: Pending, target: String) {
+    /**
+     * 安排一次「确认期后判定」。
+     *
+     * 到期时读取当时的 count：
+     *   2 → 执行双击目标
+     *   3 → 执行三击目标（若未配置三击目标则退回双击目标，避免「按三下没反应」）
+     */
+    private fun scheduleConfirm(
+        which: Pending,
+        dblTarget: String,
+        tripleTarget: String,
+        waitMs: Long
+    ) {
         cancelPending(which)
         val r = Runnable {
             pendingRunnable.remove(which)
-            if (which == Pending.UP) {
-                if (KeyPressLogic.confirm(KeyPressLogic.Result(upCount, upLast, true, false))) {
-                    upCount = 0
-                    Diag.log("volkey", "double UP 确认通过 → $target")
-                    Triggers.runAction(this, target, "volup")
-                }
+            val cur = if (which == Pending.UP) {
+                KeyPressLogic.Result(upCount, upFirst, upLast, true, false, 0, upRapid, upRapidFirst)
             } else {
-                if (KeyPressLogic.confirm(KeyPressLogic.Result(downCount, downLast, true, false))) {
-                    downCount = 0
-                    Diag.log("volkey", "double DOWN 确认通过 → $target")
-                    Triggers.runAction(this, target, "voldown")
-                }
+                KeyPressLogic.Result(downCount, downFirst, downLast, true, false, 0, downRapid, downRapidFirst)
             }
+            val taps = KeyPressLogic.resolve(cur)
+            if (which == Pending.UP) { upCount = 0; upRapid = 0; upRapidFirst = 0L }
+            else { downCount = 0; downRapid = 0; downRapidFirst = 0L }
+            if (taps == 0) return@Runnable
+
+            // 选目标：三击优先用三击目标，回落到双击；双击则用双击目标，回落到三击
+            val target = if (taps == 3) {
+                if (tripleTarget.isNotEmpty() && !sameComp(tripleTarget)) tripleTarget
+                else if (dblTarget.isNotEmpty() && !sameComp(dblTarget)) dblTarget
+                else ""
+            } else {
+                if (dblTarget.isNotEmpty() && !sameComp(dblTarget)) dblTarget
+                else if (tripleTarget.isNotEmpty() && !sameComp(tripleTarget)) tripleTarget
+                else ""
+            }
+            if (target.isEmpty()) {
+                Diag.log("volkey", "${taps}连 但没有可用目标")
+                return@Runnable
+            }
+            val src = "vol" + (if (which == Pending.UP) "up" else "down")
+            Diag.log("volkey", "${taps}连 ${if (which == Pending.UP) "UP" else "DOWN"} → $target")
+            Triggers.runAction(this, target, src)
         }
         pendingRunnable[which] = r
-        mainHandler.postDelayed(r, KeyPressLogic.CONFIRM_MS)
+        // 只等「窗口剩余时间」：这样整串手势的总耗时严格不超过用户设定的窗口值
+        mainHandler.postDelayed(r, waitMs)
     }
 
     private fun cancelPending(which: Pending) {
@@ -298,9 +394,15 @@ class TapAgentService : AccessibilityService() {
     /** 服务重连 / 熄屏 / 销毁时清零，确保复活不会带着旧计数误触发。 */
     private fun resetGestureCounters() {
         upCount = 0
+        upFirst = 0L
         upLast = 0L
+        upRapid = 0
+        upRapidFirst = 0L
         downCount = 0
+        downFirst = 0L
         downLast = 0L
+        downRapid = 0
+        downRapidFirst = 0L
         cancelPending(Pending.UP)
         cancelPending(Pending.DOWN)
     }

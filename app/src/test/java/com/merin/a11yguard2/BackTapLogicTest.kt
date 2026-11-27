@@ -91,7 +91,7 @@ class BackTapLogicTest {
         assertEquals(0, d.triggers)
         assertTrue(events.last().accepted)
         assertEquals(1, events.last().count)
-        assertEquals("重新计数", events.last().reason)
+        assertTrue("应为重新计数，实际=" + events.last().reason, events.last().reason.startsWith("重新计数"))
     }
 
     @Test

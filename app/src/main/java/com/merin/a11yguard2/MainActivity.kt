@@ -1,6 +1,12 @@
 package com.merin.a11yguard2
 
 import android.app.Activity
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.card.MaterialCardView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.materialswitch.MaterialSwitch
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -31,17 +37,31 @@ import android.widget.TextView
 import android.widget.Toast
 import kotlin.math.abs
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val PAGE_COUNT = 6
-        private const val BG = "#101418"
-        private const val CARD = "#171C22"
-        private const val CARD2 = "#1E252D"
-        private const val TEXT = "#F2F4F6"
-        private const val SUB = "#A9B4BE"
-        private const val GREEN = "#2E7D32"
-        private const val ORANGE = "#EF6C00"
+
+        // 颜色全部走 Material 3 主题（res/values/colors.xml），
+        // 这里保留旧常量名作为"语义别名"，避免改动上百处调用点。
+        // 取值改为解析主题属性，这样系统深色/浅色切换、动态取色都能跟上。
+        private const val BG = "#0E1215"
+        private const val CARD = "#161C21"
+        private const val CARD2 = "#1C2329"
+        private const val TEXT = "#E3E8EA"
+        private const val SUB = "#9BAAAF"
+        private const val GREEN = "#4CAF7D"
+        private const val ORANGE = "#E8836B"
+    }
+
+    /** 从主题取颜色，避免硬编码（Material 3 组件要求解析后的 ARGB）。 */
+    private fun themeColor(attr: Int): Int {
+        val ta = obtainStyledAttributes(intArrayOf(attr))
+        return try {
+            ta.getColor(0, Color.WHITE)
+        } finally {
+            ta.recycle()
+        }
     }
 
     private lateinit var content: FrameLayout
@@ -70,6 +90,7 @@ class MainActivity : Activity() {
     private lateinit var modeButtons: MutableList<TextView>
     private lateinit var diagBody: TextView
     private var backTapTest: TextView? = null
+    private var shakeTest: TextView? = null
 
     private val titles = arrayOf("概览", "服务", "手势", "设置", "诊断", "关于")
     private val icons = intArrayOf(
@@ -104,17 +125,17 @@ class MainActivity : Activity() {
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
-            ).apply { bottomMargin = dp(60) }
+            ).apply { bottomMargin = dp(80) }
         )
 
         nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#171C22"))
+            setBackgroundColor(Color.parseColor(CARD))
         }
         root.addView(
             nav,
             FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(60),
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(80),
                 Gravity.BOTTOM
             )
         )
@@ -145,16 +166,116 @@ class MainActivity : Activity() {
         }.getOrDefault("?"))
     }
 
+    /**
+     * 状态刷新的定时器。
+     *
+     * ── 为什么需要它 ──
+     *
+     * 用户可能在别的地方改变状态而我们收不到回调：
+     *   · 在「系统无障碍设置」里开关了服务，返回应用
+     *   · 服务被系统杀掉 / 被保活服务拉回来
+     *   · 后台把服务切走了
+     *
+     * 原来只靠 onResume 刷一次，但页面是缓存复用的，页面上的每个开关与
+     * 选择行只在创建时读过一次值，所以看起来"要退出重进才刷新"。
+     *
+     * 现在：页面可见时每 1.2 秒比对一次关键状态，变了就重建当前页。
+     * 只在「有变化」时才重建，避免无谓的 View 重绘与焦点跳动（读屏最怕焦点乱跳）。
+     */
+    private val stateWatcher = object : Runnable {
+        override fun run() {
+            if (!isResumed) return
+            val sig = stateSignature()
+            if (sig != lastStateSignature) {
+                lastStateSignature = sig
+                invalidateCurrentPage()
+            }
+            window.decorView.postDelayed(this, 1200)
+        }
+    }
+
+    /** 当前所有"可能被外部改变"的状态指纹。 */
+    private fun stateSignature(): String {
+        val enabled = runCatching {
+            Settings.Secure.getString(
+                contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ).orEmpty()
+        }.getOrDefault("")
+        val sb = StringBuilder(enabled)
+        sb.append('|').append(ToggleRouter.mode(this))
+        sb.append('|').append(if (TapAgentService.instance != null) 1 else 0)
+        sb.append('|').append(if (BackTapRuntime.running) 1 else 0)
+        return sb.toString()
+    }
+
+    private var lastStateSignature = ""
+    private var isResumed = false
+
+    /**
+     * 用户是否正在交互（输入框有焦点 / 有对话框在场）。
+     *
+     * 重建页面会移除所有 View，若用户正在输入框里打字或在对话框里选择，
+     * 重建会把输入内容与焦点一起丢掉。所以这些情况下跳过一次重建，
+     * 等用户结束交互后的下一轮再刷。
+     */
+    private fun isUserInteracting(): Boolean {
+        // 有对话框在前台
+        if (currentFocus is android.widget.EditText) return true
+        val root = window.decorView
+        return hasFocusedEditText(root)
+    }
+
+    private fun hasFocusedEditText(v: View): Boolean {
+        if (v is android.widget.EditText && v.hasFocus()) return true
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) {
+                if (hasFocusedEditText(v.getChildAt(i))) return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 重建当前页的全部 View。
+     *
+     * 为什么直接重建而不是逐个刷新控件：设置页有几十个开关与选择行，
+     * 逐一更新需要为每个控件维护引用，容易遗漏（之前正是漏了才需要退出重进）。
+     * 重建虽然"重"，但只有状态真的变化时才发生，实际开销可以接受，
+     * 而且能保证 100% 一致。
+     */
+    private fun invalidateCurrentPage() {
+        // 保护：如果用户正在跟某个输入框/对话框交互，不要重建（会打断输入与读屏焦点）
+        if (isUserInteracting()) return
+        pages[current] = null
+        val page = buildPage(current).also { pages[current] = it }
+        content.removeAllViews()
+        content.addView(page)
+        // 重建后重新挂测试监听（摇一摇/背面敲击的实时区域）
+        if (current == 2) {
+            bindBackTapTest()
+        }
+        if (::diagBody.isInitialized) runCatching { diagBody.text = Diag.dump() }
+        Diag.log("ui", "页面 ${current} 因状态变化重建")
+    }
+
     override fun onResume() {
         super.onResume()
+        isResumed = true
         if (::summary.isInitialized) refreshState()
+        // 从系统无障碍设置返回时，服务状态很可能已变 —— 立刻重建一次当前页
+        lastStateSignature = stateSignature()
+        invalidateCurrentPage()
         if (current == 2) {
             BackTapRuntime.acquire(this, BackTapRuntime.OWNER_TEST)
             bindBackTapTest()
         }
+        window.decorView.removeCallbacks(stateWatcher)
+        window.decorView.postDelayed(stateWatcher, 1200)
     }
 
     override fun onPause() {
+        isResumed = false
+        runCatching { window.decorView.removeCallbacks(stateWatcher) }
         BackTapRuntime.testListener = null
         BackTapRuntime.release(this, BackTapRuntime.OWNER_TEST)
         super.onPause()
@@ -162,25 +283,56 @@ class MainActivity : Activity() {
 
     // ---------- 导航 ----------
 
+    /**
+     * 底部导航：按 Material 3 NavigationBar 规范实现。
+     *
+     * 规范要点（与原来的土办法对比）：
+     *   · 选中项：图标与文字用 primary 色 + 胶囊形高亮背景（32dp 高的 pill）
+     *   · 未选中：用 onSurfaceVariant 色，无背景
+     *   · 图标 24dp、文字 12sp、间距 4dp
+     *   · 整条高 80dp，与内容区之间无阴影（M3 用色块分层而非阴影）
+     *   · 触摸目标至少 48dp，读屏焦点明确
+     */
     private fun buildNav() {
-        titles.forEachIndexed { i, t ->
+        // 只移除已脱离视图树的旧标签（正常情况下为空），保留真正在用的。
+        // 若直接 clear() 会把正在显示的标签也丢掉，导致高亮失效。
+        tabs.removeAll { it.parent == null }
+        titles.forEachIndexed { i, title ->
             val tab = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
                 isClickable = true
                 isFocusable = true
-                contentDescription = "底部导航-$t"
+                contentDescription = "底部导航-$title"
+                setPadding(0, dp(8), 0, dp(8))
                 setOnClickListener { show(i) }
+                setOnLongClickListener { show(i); true }
+            }
+            // 图标外面套一个胶囊容器，选中时上底色（M3 NavigationBar 的做法）
+            val pill = FrameLayout(this).apply {
+                setPadding(dp(18), dp(2), dp(18), dp(2))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(16).toFloat()
+                    setColor(Color.TRANSPARENT)
+                }
             }
             val ic = ImageView(this)
             ic.setImageResource(icons[i])
             ic.setColorFilter(Color.parseColor(SUB))
-            tab.addView(ic, LinearLayout.LayoutParams(dp(20), dp(20)))
+            ic.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            pill.addView(ic, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+            tab.addView(pill, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)
+            ))
+
             val tv = TextView(this).apply {
-                text = t
+                text = title
                 textSize = 11f
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                 setTextColor(Color.parseColor(SUB))
                 gravity = Gravity.CENTER
+                setPadding(0, dp(4), 0, 0)
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
             tab.addView(tv)
             nav.addView(tab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
@@ -189,6 +341,9 @@ class MainActivity : Activity() {
     }
 
     private fun show(i: Int) {
+        // 切页时把目标页作废重建：保证每次进入页面看到的都是最新配置，
+        // 而不是"上次打开时缓存的旧值"。
+        if (current != i) pages[i] = null
         current = i
         val page = pages[i] ?: buildPage(i).also { pages[i] = it }
         content.removeAllViews()
@@ -200,10 +355,23 @@ class MainActivity : Activity() {
             BackTapRuntime.testListener = null
             BackTapRuntime.release(this, BackTapRuntime.OWNER_TEST)
         }
+        val sel = Color.parseColor(GREEN)
+        val unsel = Color.parseColor(SUB)
+        // 每个标签使用**独立**的 Drawable 实例。
+        // 共享同一个实例时，View 的 background 状态会互相影响（曾导致
+        // 同时出现两个绿色胶囊）。用 Mutate 也不行 —— 必须各自 new。
         tabs.forEachIndexed { idx, tab ->
+            val pill = tab.getChildAt(0) as FrameLayout
+            val ic = pill.getChildAt(0) as ImageView
             val tv = tab.getChildAt(1) as TextView
-            tv.setTextColor(Color.parseColor(if (idx == i) TEXT else SUB))
-            if (idx == i) tab.setBackgroundColor(Color.parseColor("#232B33")) else tab.setBackgroundColor(Color.TRANSPARENT)
+            val on = idx == i
+            tv.setTextColor(if (on) sel else unsel)
+            ic.setColorFilter(if (on) sel else unsel)
+            pill.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(if (on) (0x26 shl 24 or 0x4CAF7D) else Color.TRANSPARENT)
+            }
+            tab.isSelected = on
         }
         content.announceForAccessibility(titles[i])
     }
@@ -554,7 +722,7 @@ class MainActivity : Activity() {
             return
         }
         if (prefs.getBoolean("confirm_before_toggle", false)) {
-            AlertDialog.Builder(this)
+            MaterialAlertDialogBuilder(this)
                 .setTitle("确认切换")
                 .setMessage(if (SvcRepo.isEnabled(this, GuardA11yService.COMP)) "将关闭无障碍守护" else "将开启无障碍守护")
                 .setPositiveButton("确认") { _, _ -> doToggle() }
@@ -576,7 +744,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "$label 已${if (want) "开启" else "关闭"}", Toast.LENGTH_SHORT).show()
         } else {
             Diag.log("toggle", "fail ${res.logLine()}")
-            AlertDialog.Builder(this)
+            MaterialAlertDialogBuilder(this)
                 .setTitle("切换失败")
                 .setMessage(res.reason ?: "未完成")
                 .setPositiveButton("打开系统无障碍设置") { _, _ -> openA11ySettings() }
@@ -667,7 +835,7 @@ class MainActivity : Activity() {
         head.addView(pill("刷新") { fillServices() })
         ll.addView(head, wrap().apply { topMargin = dp(8) })
 
-        val onlyUser = Switch(this).apply {
+        val onlyUser = MaterialSwitch(this).apply {
             text = "仅显示用户安装的应用"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -676,6 +844,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 prefs.edit().putBoolean("only_user_apps", v).apply()
                 Diag.log("setting", "only_user_apps=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 fillServices()
             }
         }
@@ -715,7 +885,7 @@ class MainActivity : Activity() {
         ll.addView(sectionTitle("音量键 · 双击触发"))
         ll.addView(hint("需开启「点按代理」服务后才生效。"))
 
-        val volSw = Switch(this).apply {
+        val volSw = MaterialSwitch(this).apply {
             text = "音量键触发"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -724,6 +894,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 prefs.edit().putBoolean("volkey_on", v).apply()
                 Diag.log("setting", "volkey_on=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 // 关闭时立刻清掉残留的按键计数与已排队的确认任务，
                 // 否则「双击一下 → 马上关开关」时，那条 220ms 后执行的
                 // 待触发任务仍会跑，表现为关掉后还切了一次服务。
@@ -733,9 +905,27 @@ class MainActivity : Activity() {
         }
         ll.addView(cardWrap(volSw))
 
+        // 音量键依赖「点按代理」服务的 onKeyEvent —— 服务没开就完全收不到按键。
+        // 这点很不直观（用户只会觉得"音量键失灵"），所以常驻显示状态。
+        if (TapAgentService.instance == null) {
+            ll.addView(warnCard(
+                "⚠ 音量键当前不会生效",
+                "「点按代理」服务未运行。音量键事件只能由无障碍服务接收，"
+                    + "服务没开就完全收不到按键。"
+            ))
+            ll.addView(cardWrap(clickRow("去开启「点按代理」服务") { openA11ySettings() }))
+        }
+
         ll.addView(cardWrap(selectorRow("双击上键", targetLabel(AppSettings.volUpTarget(this))) {
             pickTarget("选择双击上键的目标服务", AppSettings.volUpTarget(this)) { c ->
                 prefs.edit().putString("volup_target", c).apply()
+                show(2)
+            }
+        }))
+        ll.addView(cardWrap(selectorRow("三击上键", tripleLabel(AppSettings.volUpTripleTarget(this))) {
+            pickTarget("选择三击上键的目标服务（选「无」则三击不响应，只认双击）",
+                AppSettings.volUpTripleTarget(this)) { c ->
+                prefs.edit().putString("volup_triple_target", c).apply()
                 show(2)
             }
         }))
@@ -745,31 +935,211 @@ class MainActivity : Activity() {
                 show(2)
             }
         }))
+        ll.addView(cardWrap(selectorRow("三击下键", tripleLabel(AppSettings.volDownTripleTarget(this))) {
+            pickTarget("选择三击下键的目标服务（选「无」则三击不响应，只认双击）",
+                AppSettings.volDownTripleTarget(this)) { c ->
+                prefs.edit().putString("voldown_triple_target", c).apply()
+                show(2)
+            }
+        }))
+        ll.addView(hint(
+            "双击和三击可以是不同服务。判定方式：按第 2 下后等 ${KeyPressLogic.DEFAULT_WINDOW_MS}ms —— "
+                + "期间按了第 3 下就执行「三击」目标，否则执行「双击」目标。"
+                + "连按 ${KeyPressLogic.MAX_COMBO} 下以上视为在调音量，不触发任何手势。"
+        ))
+        val volLockSw = MaterialSwitch(this).apply {
+            text = "锁屏时也响应音量键"
+            textSize = 14f
+            setTextColor(Color.parseColor(TEXT))
+            isChecked = AppSettings.allowWhenLocked(this@MainActivity, AppSettings.LOCK_VOL)
+            isFocusable = true
+            setOnCheckedChangeListener { _, v ->
+                AppSettings.setAllowWhenLocked(this@MainActivity, AppSettings.LOCK_VOL, v)
+                Diag.log("setting", "lock_allow_vol=$v")
+                window.decorView.post { invalidateCurrentPage() }
+            }
+        }
+        ll.addView(cardWrap(volLockSw))
+        ll.addView(hint("关闭后，锁屏状态下双击/三击音量键不会切换服务（音量本身照常可调）。"))
+
         ll.addView(cardWrap(selectorRow("连击窗口", "${AppSettings.volWindowMs(this)} ms") {
             pickOption(
                 "音量键连击间隔（超出即从 1 重计）",
-                listOf("200" to "200ms", "300" to "300ms", "400" to "400ms",
-                    "500" to "500ms（标准）", "600" to "600ms"),
+                listOf(
+                    "100" to "100ms（最快，需按得很快）",
+                    "150" to "150ms",
+                    "200" to "200ms",
+                    "300" to "300ms（推荐）",
+                    "400" to "400ms",
+                    "500" to "500ms",
+                    "600" to "600ms（慢手）"
+                ),
                 AppSettings.volWindowMs(this).toString()
             ) { v ->
                 prefs.edit().putInt("trigger_window_ms", v.toInt()).apply()
                 show(2)
             }
         }))
-        ll.addView(cardWrap(selectorRow("通用震动", vibLabel(AppSettings.genVibMs(this))) {
-            pickOption(
-                "通用震动时长",
-                listOf("60" to "轻（60ms）", "110" to "中（110ms）",
-                    "200" to "标准（200ms）", "250" to "强（250ms）"),
-                AppSettings.genVibMs(this).toString()
-            ) { v ->
-                prefs.edit().putInt("gen_vib", v.toInt()).apply()
-                show(2)
+        // ══════════ 摇一摇 ══════════
+        ll.addView(sectionTitle("摇一摇"))
+        ll.addView(hint(
+            "甩动手机触发。判定算法用业界经典实现（变化率 + 连续计数）："
+                + "甩动是反复来回、每次换向都产生一次大变化率；"
+                + "而「拿起/放下手机」虽然撞击更猛，但只发生一次，凑不满连续次数。"
+        ))
+
+        val shakeSw = MaterialSwitch(this).apply {
+            text = "摇一摇触发"
+            textSize = 14f
+            setTextColor(Color.parseColor(TEXT))
+            isChecked = AppSettings.shakeOn(this@MainActivity)
+            isFocusable = true
+            setOnCheckedChangeListener { _, v ->
+                prefs.edit().putBoolean("shake_on", v).apply()
+                Diag.log("setting", "shake_on=$v")
+                TapAgentService.instance?.reloadShake()
+                if (v && TapAgentService.instance == null) {
+                    toast("需先开启「点按代理」服务，摇一摇才会生效")
+                }
+                window.decorView.post { invalidateCurrentPage() }
             }
-        }))
+        }
+        ll.addView(cardWrap(shakeSw))
+
+        if (!AppSettings.shakeOn(this)) {
+            ll.addView(hint("摇一摇已关闭。打开后需要选一个目标服务。"))
+        } else {
+            ll.addView(cardWrap(selectorRow("摇动次数", "摇 ${AppSettings.shakeCount(this)} 次触发") {
+                pickOption(
+                    "摇动次数（1-10）",
+                    (1..10).map { it.toString() to "摇 $it 次" },
+                    AppSettings.shakeCount(this).toString()
+                ) { v ->
+                    prefs.edit().putInt("shake_count_free", v.toInt()).apply()
+                    TapAgentService.instance?.reloadShake()
+                    show(2)
+                }
+            }))
+            ll.addView(cardWrap(selectorRow("摇一摇目标服务", targetLabel(AppSettings.shakeTarget(this))) {
+                pickTarget("选择摇一摇的目标服务", AppSettings.shakeTarget(this)) { c ->
+                    prefs.edit().putString("shake_target", c).apply()
+                    TapAgentService.instance?.reloadShake()
+                    show(2)
+                }
+            }))
+
+            val shakeLockSw = MaterialSwitch(this).apply {
+                text = "锁屏时也响应摇一摇"
+                textSize = 14f
+                setTextColor(Color.parseColor(TEXT))
+                isChecked = AppSettings.allowWhenLocked(this@MainActivity, AppSettings.LOCK_SHAKE)
+                isFocusable = true
+                setOnCheckedChangeListener { _, v ->
+                    AppSettings.setAllowWhenLocked(this@MainActivity, AppSettings.LOCK_SHAKE, v)
+                    Diag.log("setting", "lock_allow_shake=$v")
+                    window.decorView.post { invalidateCurrentPage() }
+                }
+            }
+            ll.addView(cardWrap(shakeLockSw))
+            ll.addView(hint(
+                "摇一摇默认**锁屏时不响应** —— 手机放口袋里走路、放桌上震动都可能误触发。"
+            ))
+
+            // 实时测试区
+            ll.addView(sectionTitle("摇一摇 · 测试"))
+            val shakeTestTv = TextView(this).apply {
+                textSize = 13f
+                setTextColor(Color.parseColor(TEXT))
+                setBackgroundColor(Color.parseColor(CARD2))
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                text = "等待传感器事件…\n（拿起手机甩一下试试）"
+            }
+            shakeTest = shakeTestTv
+            ll.addView(cardWrap(shakeTestTv))
+        }
+
+        // ── 震动：每个手势独立开关 + 独立时长 ──
+        //
+        // 分三类而不是一个总开关，因为触发频率差很多：
+        //   音量键：手动触发，偶尔
+        //   背面敲击：含"计入中间次数"的提示，中等
+        //   摇一摇：甩动时连续触发，最吵
+        // 有人要音量键有反馈但摇一摇安静，共用一个开关做不到。
+        val vibAllSw = MaterialSwitch(this).apply {
+            text = "关闭所有震动"
+            textSize = 14f
+            setTextColor(Color.parseColor(TEXT))
+            isChecked = AppSettings.vibAllOff(this@MainActivity)
+            isFocusable = true
+            setOnCheckedChangeListener { _, v ->
+                prefs.edit().putBoolean("vib_all_off", v).apply()
+                Diag.log("setting", "vib_all_off=$v")
+                window.decorView.post { invalidateCurrentPage() }
+            }
+        }
+        ll.addView(cardWrap(vibAllSw))
+
+        val allOff = AppSettings.vibAllOff(this)
+        if (allOff) {
+            ll.addView(hint("已全局关闭震动。下面三项的独立设置暂不生效，手势本身仍正常工作。"))
+        }
+
+        // 三类各自的开关与时长
+        listOf(
+            Triple(AppSettings.VIB_VOL, "音量键震动", "双击/三击音量键时的反馈"),
+            Triple(AppSettings.VIB_TAP, "背面敲击震动", "敲击计数与触发时的反馈"),
+            Triple(AppSettings.VIB_SHAKE, "摇一摇震动", "甩动触发时的反馈")
+        ).forEach { (kind, label, desc) ->
+            val sw = MaterialSwitch(this).apply {
+                text = label
+                textSize = 14f
+                setTextColor(Color.parseColor(if (allOff) SUB else TEXT))
+                isChecked = AppSettings.vibOn(this@MainActivity, kind) && !allOff
+                isEnabled = !allOff
+                isFocusable = true
+                setOnCheckedChangeListener { _, v ->
+                    AppSettings.setVibOn(this@MainActivity, kind, v)
+                    Diag.log("setting", "vib_$kind=$v")
+                    window.decorView.post { invalidateCurrentPage() }
+                }
+            }
+            ll.addView(cardWrap(sw))
+
+            val curMs = if (kind == AppSettings.VIB_VOL) {
+                AppSettings.genVibMs(this)
+            } else {
+                AppSettings.vibMs(this, kind, 35)
+            }
+            ll.addView(cardWrap(selectorRow(
+                "$label · 时长",
+                vibLabelFor(curMs, kind)
+            ) {
+                pickOption(
+                    desc,
+                    listOf(
+                        "0" to "关闭（不震动）",
+                        "15" to "极轻（15ms）",
+                        "30" to "很轻（30ms）",
+                        "60" to "轻（60ms）",
+                        "110" to "中（110ms）",
+                        "160" to "标准（160ms）",
+                        "200" to "较强（200ms）",
+                        "250" to "强（250ms）"
+                    ),
+                    curMs.toString()
+                ) { v ->
+                    if (kind == AppSettings.VIB_VOL) {
+                        prefs.edit().putInt("gen_vib", v.toInt()).apply()
+                    } else {
+                        AppSettings.setVibMs(this@MainActivity, kind, v.toInt())
+                    }
+                    show(2)
+                }
+            }))
+        }
 
         ll.addView(sectionTitle("背面敲击"))
-        val backTapSw = Switch(this).apply {
+        val backTapSw = MaterialSwitch(this).apply {
             text = "背面敲击（双击 / 三击）"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -778,6 +1148,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 prefs.edit().putBoolean("backtap_on", v).apply()
                 Diag.log("setting", "backtap_on=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 BackTapRuntime.reload()
                 if (v) BackTapRuntime.acquire(this@MainActivity, BackTapRuntime.OWNER_TEST)
                 renderBackTapTest(BackTapRuntime.lastEvent)
@@ -808,17 +1180,51 @@ class MainActivity : Activity() {
         }))
 
         ll.addView(cardWrap(selectorRow(
-            "目标服务",
+            "目标服务（双击）",
             targetLabel(AppSettings.backTapTarget(this))
         ) {
-            pickTarget("选择背面敲击要切换的服务", AppSettings.backTapTarget(this)) { c ->
+            pickTarget("选择背面双击要切换的服务", AppSettings.backTapTarget(this)) { c ->
                 prefs.edit().putString("backtap_target", c).apply()
                 renderBackTapTest(BackTapRuntime.lastEvent)
                 show(2)
             }
         }))
 
-        val screenOffSw = Switch(this).apply {
+        ll.addView(cardWrap(selectorRow(
+            "目标服务（三击）",
+            tripleLabel(AppSettings.backTapTripleTarget(this))
+        ) {
+            pickTarget(
+                "选择背面三击要切换的服务（选「无」则三击不响应，敲 2 下即触发）",
+                AppSettings.backTapTripleTarget(this)
+            ) { c ->
+                prefs.edit().putString("backtap_triple_target", c).apply()
+                BackTapRuntime.reload()
+                renderBackTapTest(BackTapRuntime.lastEvent)
+                show(2)
+            }
+        }))
+        ll.addView(hint(
+            "配了三击目标后，敲 2 下会先等一拍（约 0.3–0.5 秒）再判定："
+                + "期间又敲了第 3 下就切「三击」服务，否则切「双击」服务。"
+                + "不配三击目标时保持原样，敲满即触发。"
+        ))
+
+        val tapLockSw = MaterialSwitch(this).apply {
+            text = "锁屏时也响应敲击"
+            textSize = 14f
+            setTextColor(Color.parseColor(TEXT))
+            isChecked = AppSettings.allowWhenLocked(this@MainActivity, AppSettings.LOCK_BACKTAP)
+            isFocusable = true
+            setOnCheckedChangeListener { _, v ->
+                AppSettings.setAllowWhenLocked(this@MainActivity, AppSettings.LOCK_BACKTAP, v)
+                Diag.log("setting", "lock_allow_backtap=$v")
+                window.decorView.post { invalidateCurrentPage() }
+            }
+        }
+        ll.addView(cardWrap(tapLockSw))
+
+        val screenOffSw = MaterialSwitch(this).apply {
             text = "熄屏后继续检测（耗电增加）"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -827,6 +1233,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 prefs.edit().putBoolean("backtap_screen_off", v).apply()
                 Diag.log("setting", "backtap_screen_off=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 BackTapRuntime.reload()
             }
         }
@@ -870,6 +1278,34 @@ class MainActivity : Activity() {
 
     // ---------- 背面敲击 ----------
 
+    /** 摇一摇测试区渲染。 */
+    private fun renderShakeTest(s: ShakeWatcher.Sample?) {
+        val tv = shakeTest ?: return
+        if (s == null) {
+            tv.text = "等待传感器事件…\n（拿起手机甩一下试试）"
+            return
+        }
+        val sb = StringBuilder()
+        sb.append("变化率 %.0f".format(s.speed))
+        sb.append(" / 阈值 %.0f".format(s.threshold))
+        sb.append("\n计数 %d / %d".format(s.count, s.need))
+        when (s.verdict) {
+            ShakeLogic.Verdict.OK -> sb.append("\n✓ 已触发")
+            ShakeLogic.Verdict.COUNTING -> sb.append("\n… 累计中")
+            ShakeLogic.Verdict.COOLDOWN -> sb.append("\n冷却中")
+            else -> Unit
+        }
+        tv.text = sb.toString()
+    }
+
+    private fun bindShakeTest() {
+        ShakeWatcher.testListener = { smp -> shakeTest?.post { renderShakeTest(smp) } }
+    }
+
+    private fun unbindShakeTest() {
+        ShakeWatcher.testListener = null
+    }
+
     private fun bindBackTapTest() {
         val tv = backTapTest ?: return
         BackTapRuntime.testListener = { ev -> tv.post { renderBackTapTest(ev) } }
@@ -902,13 +1338,18 @@ class MainActivity : Activity() {
     private fun backTapSensitivityLabel(): String {
         val lv = AppSettings.backTapSensitivity(this)
         val p = BackTapLogic.paramsForSensitivity(lv)
-        return "$lv / 10 · 阈值 %.1f · 间隔 %dms".format(p.ampThreshold, p.maxGapMs)
+        return "$lv / 10 · 阈值 %.1f · 间隔 %d–%dms".format(
+            p.ampThreshold, BackTapLogic.MIN_GAP_MS, p.maxGapMs
+        )
     }
 
     private fun backTapLevelText(level: Int): String {
         val p = BackTapLogic.paramsForSensitivity(level)
-        return "$level / 10 · 振幅阈值 %.1f m/s² · 间隔窗口 %dms · 置信度 %.2f"
-            .format(p.ampThreshold, p.maxGapMs, p.minConfidence)
+        return ("$level / 10 · 振幅阈值 %.1f m/s²\n"
+            + "相邻间隔 %.0f–%dms · 整串上限 %dms · 置信度 %.2f").format(
+            p.ampThreshold, BackTapLogic.MIN_GAP_MS.toFloat(), p.maxGapMs,
+            BackTapLogic.MAX_COMBO_SPAN_MS, p.minConfidence
+        )
     }
 
     private fun backTapSensitivityDialog() {
@@ -935,7 +1376,7 @@ class MainActivity : Activity() {
             addView(tv)
             addView(sb)
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("灵敏度（1 最稳 / 10 最灵敏）")
             .setView(box)
             .setPositiveButton("保存") { _, _ ->
@@ -948,12 +1389,34 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun vibLabel(ms: Int): String = when {
-        ms <= 0 -> "关"
-        ms <= 60 -> "轻（${ms}ms）"
-        ms <= 110 -> "中（${ms}ms）"
-        ms <= 160 -> "标准（${ms}ms）"
-        else -> "强（${ms}ms）"
+    /** 按功能类别显示震动时长（含"已关闭"与"全局关闭"两种状态）。 */
+    private fun vibLabelFor(ms: Int, kind: String): String {
+        if (AppSettings.vibAllOff(this)) return "已全局关闭"
+        if (!AppSettings.vibOn(this, kind)) return "已关闭（此手势不震动）"
+        return when {
+            ms <= 0 -> "关闭（不震动）"
+            ms <= 15 -> "极轻（${ms}ms）"
+            ms <= 30 -> "很轻（${ms}ms）"
+            ms <= 60 -> "轻（${ms}ms）"
+            ms <= 110 -> "中（${ms}ms）"
+            ms <= 160 -> "标准（${ms}ms）"
+            ms <= 200 -> "较强（${ms}ms）"
+            else -> "强（${ms}ms）"
+        }
+    }
+
+    private fun vibLabel(ms: Int): String {
+        if (AppSettings.vibAllOff(this)) return "已全局关闭"
+        return when {
+            ms <= 0 -> "关闭（不震动）"
+            ms <= 20 -> "极轻（${ms}ms）"
+            ms <= 40 -> "很轻（${ms}ms）"
+            ms <= 60 -> "轻（${ms}ms）"
+            ms <= 110 -> "中（${ms}ms）"
+            ms <= 160 -> "标准（${ms}ms）"
+            ms <= 200 -> "较强（${ms}ms）"
+            else -> "强（${ms}ms）"
+        }
     }
 
     private fun actionLabel(a: String): String = when {
@@ -1037,7 +1500,7 @@ class MainActivity : Activity() {
         ll.addView(cardWrap(clickRow("我已执行，检测授权") { checkSecurePermission(true) }))
 
         ll.addView(sectionTitle("快捷触发（需「点按代理」服务运行）"))
-        val volSw = Switch(this).apply {
+        val volSw = MaterialSwitch(this).apply {
             text = "音量键启动（双击音量上/下键）"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -1046,6 +1509,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 prefs.edit().putBoolean("volkey_on", v).apply()
                 Diag.log("setting", "volkey_on=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 TapAgentService.instance?.onVolKeySwitchChanged()
                 if (v && TapAgentService.instance == null) toast("需先开启「点按代理」服务，音量键才会生效")
             }
@@ -1083,7 +1548,7 @@ class MainActivity : Activity() {
                 show(3)
             }
         }))
-        val stats = Switch(this).apply {
+        val stats = MaterialSwitch(this).apply {
             text = "守护统计通知（保活通知里显示成功/失败次数）"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -1106,7 +1571,7 @@ class MainActivity : Activity() {
 
         ll.addView(sectionTitle("TalkBack 占位（实验）"))
         var tbBusy = false
-        val tbSw = Switch(this).apply {
+        val tbSw = MaterialSwitch(this).apply {
             text = "TalkBack 占位（让第三方认为已开启）"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -1141,7 +1606,7 @@ class MainActivity : Activity() {
         ll.addView(hint("只影响“看起来是否开启”：不朗读、不接管触摸、不消费按键；关闭开关会撤销全部写入。"))
 
         ll.addView(sectionTitle("防误触"))
-        val sw = Switch(this).apply {
+        val sw = MaterialSwitch(this).apply {
             text = "切换前二次确认"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -1150,6 +1615,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 prefs.edit().putBoolean("confirm_before_toggle", v).apply()
                 Diag.log("setting", "confirm_before_toggle=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
             }
         }
         ll.addView(cardWrap(sw))
@@ -1161,7 +1628,7 @@ class MainActivity : Activity() {
 
         // ---------- 内置更新 ----------
         ll.addView(sectionTitle("更新"))
-        val updateSw = Switch(this).apply {
+        val updateSw = MaterialSwitch(this).apply {
             text = "检查更新"
             textSize = 14f
             setTextColor(Color.parseColor(TEXT))
@@ -1170,6 +1637,8 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v ->
                 AppSettings.setUpdateCheckOn(this@MainActivity, v)
                 Diag.log("setting", "update_on=$v")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 if (v && AppSettings.updateSource(this@MainActivity).isEmpty()) {
                     toast("请先填写更新源（owner/repo 或 JSON 地址）")
                 }
@@ -1279,7 +1748,7 @@ class MainActivity : Activity() {
             append("\n\n二次开发的用户：把 AppSettings.DEFAULT_UPDATE_SOURCE 改成自己的仓库，")
             append("就能让自己的发行版自动更新到自己那里。")
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("更新源")
             .setMessage(msg)
             .setView(et)
@@ -1288,16 +1757,22 @@ class MainActivity : Activity() {
                 if (v.isEmpty() && builtIn.isNotEmpty()) {
                     AppSettings.resetUpdateSource(this)
                     Diag.log("setting", "update_source -> 恢复内置默认")
+                    // 改完设置立即重建当前页，保证显示与配置一致
+                    window.decorView.post { invalidateCurrentPage() }
                     toast("已恢复内置默认更新源")
                 } else {
                     AppSettings.setUpdateSource(this, v)
                     Diag.log("setting", "update_source=${v.take(60)}")
+                    // 改完设置立即重建当前页，保证显示与配置一致
+                    window.decorView.post { invalidateCurrentPage() }
                 }
                 refreshState()
             }
             .setNeutralButton("恢复内置") { _, _ ->
                 AppSettings.resetUpdateSource(this)
                 Diag.log("setting", "update_source -> 恢复内置默认")
+                // 改完设置立即重建当前页，保证显示与配置一致
+                window.decorView.post { invalidateCurrentPage() }
                 toast("已恢复内置默认更新源")
                 refreshState()
             }
@@ -1331,7 +1806,7 @@ class MainActivity : Activity() {
             setHintTextColor(Color.parseColor(SUB))
             minLines = 6
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("导入旧格式")
             .setView(et)
             .setPositiveButton("导入") { _, _ ->
@@ -1351,7 +1826,7 @@ class MainActivity : Activity() {
         val xml = LegacyCodec.buildXml(lockedList(), pinnedList())
         val cm = getSystemService(ClipboardManager::class.java)
         cm.setPrimaryClip(ClipData.newPlainText("a11ytool-prefs", xml))
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("已复制到剪贴板")
             .setMessage(xml)
             .setPositiveButton("好", null)
@@ -1434,7 +1909,7 @@ class MainActivity : Activity() {
         Diag.log("perm", "WRITE_SECURE_SETTINGS granted=$ok")
         refreshState()
         if (!showDialog) return
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(if (ok) "直写权限：已授权" else "直写权限：未授权")
             .setMessage(
                 if (ok) {
@@ -1528,7 +2003,7 @@ class MainActivity : Activity() {
                 targetLabel(AppSettings.volDownTarget(this))
         )
         Diag.log("checkup", lines.joinToString(" | "))
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("权限体检")
             .setMessage(lines.joinToString("\n"))
             .setPositiveButton("好", null)
@@ -1536,7 +2011,7 @@ class MainActivity : Activity() {
     }
 
     private fun emergency() {
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("紧急恢复")
             .setMessage("将关闭守护服务、清空加锁/置顶名单，并停止保活。不会卸载应用、不会删除诊断日志。确定继续？")
             .setPositiveButton("确定") { _, _ ->
@@ -1557,6 +2032,39 @@ class MainActivity : Activity() {
             .show()
     }
 
+    /** 警告卡片：橙色描边 + 标题 + 说明，用于"某功能当前不会生效"这类提示。 */
+    private fun warnCard(title: String, detail: String): MaterialCardView =
+        MaterialCardView(this).apply {
+            layoutParams = ViewGroup.MarginLayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+            radius = dp(16).toFloat()
+            cardElevation = 0f
+            setCardBackgroundColor(Color.parseColor("#2A1F1A"))
+            strokeWidth = dp(1)
+            strokeColor = Color.parseColor(ORANGE)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                addView(TextView(this@MainActivity).apply {
+                    text = title
+                    textSize = 15f
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    setTextColor(Color.parseColor(ORANGE))
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = detail
+                    textSize = 13f
+                    setTextColor(Color.parseColor(SUB))
+                    setPadding(0, dp(4), 0, 0)
+                })
+            })
+        }
+
+    /** 三击目标的一行显示（未配置时明确提示「不响应三击」）。 */
+    private fun tripleLabel(comp: String): String =
+        if (comp.isEmpty()) "未设置（三击不响应）" else targetLabel(comp)
+
     private fun targetLabel(comp: String): String =
         if (comp.isEmpty()) "未设置"
         else AppSettings.aliasOf(this, comp, SvcRepo.labelOf(this, comp))
@@ -1575,7 +2083,7 @@ class MainActivity : Activity() {
             setSingleLine()
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        android.app.AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("给「$fallback」起个名字")
             .setMessage("语音助手里说这个名字就能开关它。留空则恢复原名。")
             .setView(box)
@@ -1600,28 +2108,52 @@ class MainActivity : Activity() {
         setPadding(0, dp(4), 0, dp(8))
     }
 
-    private fun selectorRow(title: String, value: String, onClick: () -> Unit): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor(CARD))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+    /**
+     * 设置项一行：Material 卡片 + ripple 反馈。
+     *
+     * 相比原来的裸 LinearLayout：
+     *   · ripple 水波反馈（触摸有明确视觉响应）
+     *   · 16dp 圆角、Material 3 表面色
+     *   · contentDescription 保持「标题，当前 值」，读屏逻辑不变
+     */
+    private fun selectorRow(title: String, value: String, onClick: () -> Unit): MaterialCardView =
+        MaterialCardView(this).apply {
+            layoutParams = ViewGroup.MarginLayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+            radius = dp(16).toFloat()
+            cardElevation = 0f
+            setCardBackgroundColor(Color.parseColor(CARD2))
             isClickable = true
             isFocusable = true
+            rippleColor = ColorStateList.valueOf(Color.parseColor("#334CAF7D"))
             contentDescription = "$title，当前 $value"
-            addView(TextView(this@MainActivity).apply {
-                text = title
-                textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Color.parseColor(TEXT))
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = value
-                textSize = 12f
-                setTextColor(Color.parseColor(SUB))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                addView(TextView(this@MainActivity).apply {
+                    text = title
+                    textSize = 15f
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    setTextColor(Color.parseColor(TEXT))
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = value
+                    textSize = 13f
+                    setTextColor(Color.parseColor(SUB))
+                    setPadding(0, dp(3), 0, 0)
+                })
             })
             setOnClickListener { onClick() }
         }
 
+    /**
+     * 单选对话框。
+     *
+     * 选完后统一重建当前页：所有"选择行"的显示值都来自 AppSettings，
+     * 若不在选完后重建，界面会继续显示旧值（需要退出重进才刷新）。
+     * 在这里统一处理，就不用给几十个调用点逐个加刷新了。
+     */
     private fun pickOption(
         title: String,
         options: List<Pair<String, String>>,
@@ -1629,11 +2161,13 @@ class MainActivity : Activity() {
         onPick: (String) -> Unit
     ) {
         val idx = options.indexOfFirst { it.first == current }.coerceAtLeast(0)
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(title)
             .setSingleChoiceItems(options.map { it.second }.toTypedArray(), idx) { d, which ->
                 onPick(options[which].first)
                 d.dismiss()
+                // 延迟一帧：让对话框先关掉，再重建页面，避免焦点错乱
+                window.decorView.post { invalidateCurrentPage() }
             }
             .setNegativeButton("取消", null)
             .show()
@@ -1649,17 +2183,23 @@ class MainActivity : Activity() {
 
     private fun column(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(16), dp(16), dp(16), dp(24))
+        setPadding(dp(16), dp(20), dp(16), dp(32))
     }
 
     private fun wrap(): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
+    /**
+     * 分区标题。Material 3 的 label 样式：字号小、全大写感、字重中等、
+     * 与下方内容留出较大间距（24dp），形成清晰的段落分组。
+     */
     private fun sectionTitle(t: String): TextView = TextView(this).apply {
         text = t
-        textSize = 12f
-        setTextColor(Color.parseColor(SUB))
-        setPadding(0, dp(16), 0, dp(6))
+        textSize = 13f
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        letterSpacing = 0.04f
+        setTextColor(Color.parseColor(GREEN))
+        setPadding(dp(4), dp(24), 0, dp(10))
     }
 
     private fun row(t: String): TextView = TextView(this).apply {
@@ -1678,15 +2218,31 @@ class MainActivity : Activity() {
      * 触摸区域也只覆盖左边一小条 —— 表现为「只有 1/3 屏幕能点」。
      * 早期版本正是这个 bug。
      */
-    private fun cardWrap(v: View): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        addView(v, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-        setPadding(0, dp(3), 0, dp(3))
-        layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        )
+    /**
+     * 把一个视图包进 Material 卡片。
+     *
+     * 注意这里**不再**用 LinearLayout 中转：直接用 MaterialCardView 承载，
+     * 圆角与表面色由卡片自己画，避免「卡片套卡片」出现双层背景。
+     */
+    private fun cardWrap(v: View): View {
+        // 已经是卡片（selectorRow 等）就直接返回，不再包一层
+        if (v is MaterialCardView) {
+            v.layoutParams = ViewGroup.MarginLayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+            return v
+        }
+        return MaterialCardView(this).apply {
+            layoutParams = ViewGroup.MarginLayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+            radius = dp(16).toFloat()
+            cardElevation = 0f
+            setCardBackgroundColor(Color.parseColor(CARD2))
+            addView(v, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
     }
 
     private fun pill(t: String, onClick: () -> Unit): TextView = TextView(this).apply {
@@ -1740,7 +2296,7 @@ class MainActivity : Activity() {
             brand.contains("vivo") || brand.contains("iqoo") -> "vivo：i 管家 → 应用管理 → 权限管理 → 自启动；后台耗电选“允许”。"
             else -> "请在系统设置里允许本应用自启动、后台运行，并加入电池优化白名单。"
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("后台保活：" + keepaliveStatus())
             .setMessage(steps)
             .setPositiveButton("打开应用详情") { _, _ ->

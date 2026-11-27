@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Material 3 配色。
+
+  这套颜色是照着 Material 3 "tonal palette" 的思路手调的：
+  同一个色相（青绿）从暗到亮取若干档，保证组件之间有层次感，
+  而不是原来那种「全是一个深灰」的扁平感。
+-->
+<resources>
+
+    <!-- 品牌绿（Primary） -->
+    <color name="brand_green">#4CAF7D</color>
+    <color name="on_brand">#00210F</color>
+    <color name="brand_green_container">#1B4332</color>
+    <color name="on_brand_container">#A8E6C1</color>
+
+    <!-- 辅助青（Secondary） -->
+    <color name="brand_teal">#5BC8C0</color>
+
+    <!-- 背景与表面 -->
+    <color name="bg">#0E1215</color>
+    <color name="surface">#0E1215</color>
+    <color name="surface_container">#161C21</color>
+    <color name="surface_container_high">#1C2329</color>
+    <color name="surface_variant">#2A3439</color>
+
+    <!-- 文字 -->
+    <color name="on_surface">#E3E8EA</color>
+    <color name="on_surface_variant">#9BAAAF</color>
+
+    <!-- 描边 -->
+    <color name="outline">#3A464C</color>
+    <color name="outline_variant">#243035</color>
+
+    <!-- 错误 -->
+    <color name="error_red">#E8836B</color>
+
+    <!-- 交互反馈 -->
+    <color name="ripple">#334CAF7D</color>
+
+    <!-- 开关状态色 -->
+    <color name="switch_thumb">@color/switch_thumb_sel</color>
+    <color name="switch_track">@color/switch_track_sel</color>
+</resources>

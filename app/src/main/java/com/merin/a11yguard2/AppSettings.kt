@@ -61,8 +61,96 @@ object AppSettings {
         return "$at · 原因 $reason · 补回 $result"
     }
 
-    /** 每次有效动作的触觉提示时长（毫秒）。默认 35（旧版 0x23）。 */
-    fun sensorVibMs(ctx: Context): Int = p(ctx).getInt("sensor_vib", 35)
+    // ---------- 摇一摇 ----------
+    //
+    // 判定算法见 ShakeLogic（采用业界经典实现：变化率 + 连续计数）。
+
+    /** 摇一摇总开关；默认关闭，避免新用户被动开启传感器。 */
+    fun shakeOn(ctx: Context): Boolean = p(ctx).getBoolean("shake_on", false)
+
+    /** 摇动次数：摇几下触发（1-10）。 */
+    fun shakeCount(ctx: Context): Int =
+        p(ctx).getInt("shake_count_free", 3).coerceIn(1, 10)
+
+    /** 摇一摇目标服务（裸组件名或 toggle: 前缀）。 */
+    fun shakeTarget(ctx: Context): String = p(ctx).getString("shake_target", "").orEmpty()
+
+    /**
+     * 全局震动总开关。为 true 时所有震动都被跳过。
+     *
+     * 保留它是因为"开会 / 震动模块坏了"时需要一键全关；
+     * 但日常细调用下面的 [vibOn] 按功能独立控制。
+     */
+    fun vibAllOff(ctx: Context): Boolean = p(ctx).getBoolean("vib_all_off", false)
+
+    /**
+     * 每个手势的震动**独立开关**。
+     *
+     * 三类震动分开控制，因为触发频率差异很大：
+     *   · VOL   音量键 —— 手动触发，频率低
+     *   · TAP   背面敲击 —— 包括"计入中间次数"的提示音，频率中等
+     *   · SHAKE 摇一摇 —— 如果开着，甩动时会连续震，最吵
+     *
+     * 有人喜欢音量键有反馈但摇一摇安静，或反之；共用一个开关做不到。
+     */
+    const val VIB_VOL = "vol"
+    const val VIB_TAP = "tap"
+    const val VIB_SHAKE = "shake"
+
+    /**
+     * 每个手势的「锁屏时不执行」独立开关。
+     *
+     * ── 为什么每个手势要独立 ──
+     *
+     * 不同手势在锁屏时的使用意图完全不同：
+     *
+     *   · 音量键：锁屏时最常见的诉求是「调节音量」（听书、听歌），
+     *     这时误触发手势会打断播放。所以很多人希望锁屏时禁用。
+     *   · 背面敲击：锁屏时口袋摩擦/桌面震动容易误触，多数人也想禁用。
+     *   · 摇一摇：锁屏时放着不动或走路都可能误触，最应禁用。
+     *
+     * 但也有人希望「锁屏时也能切换服务」（比如盲人在口袋里盲操作），
+     * 所以不能一刀切 —— 必须逐个可配。
+     *
+     * 默认值：
+     *   音量键 / 背面敲击 → **允许**（保持现有行为，不破坏已调好的设置）
+     *   摇一摇 → **禁止**（锁屏时误触率最高）
+     */
+    const val LOCK_VOL = "vol"
+    const val LOCK_TAP = "tap"
+    const val LOCK_SHAKE = "shake"
+    const val LOCK_BACKTAP = "backtap"
+
+    /** 某手势在锁屏时是否允许执行（默认 true = 允许）。 */
+    fun allowWhenLocked(ctx: Context, kind: String): Boolean {
+        val def = kind != LOCK_SHAKE   // 摇一摇默认禁止
+        return p(ctx).getBoolean("lock_allow_$kind", def)
+    }
+
+    fun setAllowWhenLocked(ctx: Context, kind: String, allow: Boolean) {
+        p(ctx).edit().putBoolean("lock_allow_$kind", allow).apply()
+    }
+
+    /** 某个功能的震动是否开启（默认全开）。总开关关闭时一律 false。 */
+    fun vibOn(ctx: Context, kind: String): Boolean {
+        if (vibAllOff(ctx)) return false
+        return p(ctx).getBoolean("vib_$kind", true)
+    }
+
+    fun setVibOn(ctx: Context, kind: String, on: Boolean) {
+        p(ctx).edit().putBoolean("vib_$kind", on).apply()
+    }
+
+    /** 每个功能的震动时长（毫秒），独立配置。0 = 不震。 */
+    fun vibMs(ctx: Context, kind: String, fallback: Int = 35): Int =
+        p(ctx).getInt("vib_ms_$kind", fallback)
+
+    fun setVibMs(ctx: Context, kind: String, ms: Int) {
+        p(ctx).edit().putInt("vib_ms_$kind", ms).apply()
+    }
+
+    /** 兼容旧调用点：摇一摇的震动时长。 */
+    fun sensorVibMs(ctx: Context): Int = vibMs(ctx, VIB_SHAKE, 35)
 
     // ---------- 背面敲击 ----------
 
@@ -80,6 +168,20 @@ object AppSettings {
     /** 敲击后要切换的无障碍服务组件；空 = 未设置。 */
     fun backTapTarget(ctx: Context): String = p(ctx).getString("backtap_target", "").orEmpty()
 
+    /**
+     * 三击背面的目标；空 = 不响应三击（只认双击）。
+     *
+     * 与 [backTapCount] 的关系：backTapCount 决定「需要敲几下」，
+     * 而 tripleTarget 决定「敲 3 下时切到哪个服务」。
+     * 当 tripleTarget 非空时，判定逻辑会自动变成「敲 2 下等一拍、再决定」，
+     * 否则双击会被三击抢占（详见 BackTapLogic 的说明）。
+     */
+    fun backTapTripleTarget(ctx: Context): String =
+        p(ctx).getString("backtap_triple_target", "").orEmpty()
+
+    /** 是否启用了「双击/三击分开」模式。 */
+    fun backTapDualMode(ctx: Context): Boolean = backTapTripleTarget(ctx).isNotEmpty()
+
     /** 熄屏是否继续检测；开启会持有 CPU 唤醒锁，待机耗电明显增加。 */
     fun backTapScreenOff(ctx: Context): Boolean = p(ctx).getBoolean("backtap_screen_off", false)
 
@@ -92,8 +194,22 @@ object AppSettings {
 
     fun volDownTarget(ctx: Context): String = p(ctx).getString("voldown_target", "").orEmpty()
 
+    // ── 三击目标（2026-11-27 新增）──
+    //
+    // 上/下键各自支持「双击一个服务、三击另一个服务」。
+    // 判定流程见 KeyPressLogic：第 2 下进入 250ms 确认期，
+    // 期内按第 3 下 → 三击；否则 → 双击。
+
+    /** 三击上键的目标；空 = 不响应三击（只认双击）。 */
+    fun volUpTripleTarget(ctx: Context): String =
+        p(ctx).getString("volup_triple_target", "").orEmpty()
+
+    /** 三击下键的目标；空 = 不响应三击（只认双击）。 */
+    fun volDownTripleTarget(ctx: Context): String =
+        p(ctx).getString("voldown_triple_target", "").orEmpty()
+
     /** 双击窗口（毫秒），旧版默认 500，可选 200/300/400/500/600。 */
-    fun volWindowMs(ctx: Context): Int = p(ctx).getInt("trigger_window_ms", 500)
+    fun volWindowMs(ctx: Context): Int = p(ctx).getInt("trigger_window_ms", 300)
 
     /** 通用震动时长（毫秒），旧版默认 200；档位 轻60 / 中110 / 标准200 / 强250。 */
     fun genVibMs(ctx: Context): Int = p(ctx).getInt("gen_vib", 200)

@@ -69,7 +69,7 @@ object BackTapRuntime {
         val c = ctxRef ?: return
         watcher = BackTapWatcher(
             c,
-            onTrigger = { handleTrigger() },
+            onTrigger = { ev -> handleTrigger(ev) },
             onEvent = { ev ->
                 lastEvent = ev
                 testListener?.invoke(ev)
@@ -93,10 +93,40 @@ object BackTapRuntime {
         val target = AppSettings.backTapTarget(c)
         if (target.isEmpty()) {
             Diag.log("backtap", "trigger but target empty（设置里未选择目标服务）")
-            Triggers.vibrate(c, 160)
+            Triggers.vibrate(c, 160, AppSettings.VIB_TAP)
             return
         }
         Diag.log("backtap", "trigger → ${SvcRepo.normalize(target)}")
+        Triggers.runAction(c, target, "backtap")
+    }
+
+    /**
+     * 处理一次触发事件：按 taps 选择双击或三击目标。
+     *
+     * 三击目标未配置时退回双击目标 —— 否则用户敲三下会完全没反应，
+     * 那比「两下三下切同一个服务」更让人困惑。
+     */
+    private fun handleTrigger(ev: BackTapLogic.TapEvent) {
+        val c = ctxRef ?: return
+        val dbl = AppSettings.backTapTarget(c)
+        val triple = AppSettings.backTapTripleTarget(c)
+
+        // 任一目标非空即可响应：早期版本要求双击目标必须存在，
+        // 导致「只配了三击」时敲击识别成功却什么都不做。
+        val target = when {
+            ev.taps >= 3 && triple.isNotEmpty() -> triple
+            dbl.isNotEmpty() -> dbl
+            // 双击目标没配、但三击配了 → 双击也走三击目标（避免"没反应"）
+            triple.isNotEmpty() -> triple
+            else -> ""
+        }
+        if (target.isEmpty()) {
+            Diag.log("backtap", "trigger but no target（设置里未选择目标服务）")
+            Triggers.vibrate(c, 160, AppSettings.VIB_TAP)
+            return
+        }
+        val kind = if (ev.taps >= 3) "三击" else "双击"
+        Diag.log("backtap", "$kind → ${SvcRepo.normalize(target)}")
         Triggers.runAction(c, target, "backtap")
     }
 }

@@ -25,7 +25,7 @@ import kotlin.math.sqrt
  */
 class BackTapWatcher(
     private val ctx: Context,
-    private val onTrigger: () -> Unit,
+    private val onTrigger: (BackTapLogic.TapEvent) -> Unit,
     private val onEvent: (BackTapLogic.TapEvent) -> Unit
 ) : SensorEventListener {
 
@@ -51,7 +51,8 @@ class BackTapWatcher(
     fun reload() {
         val sp = AppSettings
         val params = BackTapLogic.paramsForSensitivity(sp.backTapSensitivity(ctx))
-        detector.configure(params, sp.backTapCount(ctx))
+        // 三击目标非空 → 启用双模式（敲 2 下先等一拍，看是否要敲第 3 下）
+        detector.configure(params, sp.backTapCount(ctx), sp.backTapDualMode(ctx))
         vibMs = sp.sensorVibMs(ctx)
         val allow = sp.backTapScreenOff(ctx)
         val changed = allow != allowScreenOff
@@ -172,6 +173,41 @@ class BackTapWatcher(
         }
     }
 
+    /** 双模式下的判定定时器。 */
+    private val flushHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var flushTask: Runnable? = null
+
+    /**
+     * 双模式：敲完 2 下后安排一次「延迟判定」。
+     *
+     * 若在延迟到期前又敲了第 3 下，Detector 会直接返回三击事件并清空连击，
+     * 这里的 flush 就查不到待判定连击（hasPendingCombo() 为 false），自动放弃。
+     */
+    private fun scheduleFlush() {
+        flushTask?.let { flushHandler.removeCallbacks(it) }
+        val r = object : Runnable {
+            override fun run() {
+                val ev = detector.flush(SystemClock.elapsedRealtime())
+                if (ev != null) {
+                    Diag.log(
+                        "backtap",
+                        "triggered ${ev.reason} taps=${ev.taps} peak=%.2f".format(ev.peak)
+                    )
+                    onEvent(ev)
+                    onTrigger(ev)
+                }
+            }
+        }
+        flushTask = r
+        // 等的时长比「允许的最大敲击间隔」再宽一点，确保第 3 下有时间到达
+        flushHandler.postDelayed(r, (lengthGapMs() + 120).toLong())
+    }
+
+    /** 当前灵敏度下允许的最大敲击间隔（毫秒）。 */
+    private fun lengthGapMs(): Int = runCatching {
+        BackTapLogic.paramsForSensitivity(AppSettings.backTapSensitivity(ctx)).maxGapMs
+    }.getOrDefault(300)
+
     override fun onSensorChanged(event: SensorEvent?) {
         val e = event ?: return
         val v = e.values
@@ -179,14 +215,20 @@ class BackTapWatcher(
         val ev = detector.feed(SystemClock.elapsedRealtime(), deviation) ?: return
         onEvent(ev)
         if (ev.accepted && !ev.triggered && vibMs > 0) {
-            Triggers.vibrate(ctx, vibMs)
+            Triggers.vibrate(ctx, vibMs, AppSettings.VIB_TAP)
         }
         if (ev.triggered) {
             Diag.log(
                 "backtap",
-                "triggered need=${ev.need} peak=%.2f conf=%.2f".format(ev.peak, ev.confidence)
+                "triggered taps=${ev.taps} need=${ev.need} peak=%.2f conf=%.2f"
+                    .format(ev.peak, ev.confidence)
             )
-            onTrigger()
+            onTrigger(ev)
+            return
+        }
+        // 双模式：敲到 2 下时挂一个延迟判定，等第 3 下或超时定双击
+        if (!ev.triggered && detector.hasPendingCombo()) {
+            scheduleFlush()
         }
     }
 

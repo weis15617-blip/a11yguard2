@@ -28,8 +28,14 @@ object BackTapLogic {
 
     const val GRAVITY = 9.8f
 
-    /** 同一串连击允许的最小相邻间隔：低于此值多为同一次冲击的回弹。 */
-    const val MIN_GAP_MS = 70
+    /**
+     * 同一串连击允许的最小相邻间隔。
+     *
+     * 低于此值视为「同一次冲击的回弹」（手机磕桌面会弹跳），不计入新的一次。
+     * 取 100ms：人正常敲击的最快节奏约 120–150ms，100ms 已经很快；
+     * 再快基本是回弹或抖动。
+     */
+    const val MIN_GAP_MS = 100
 
     /** 单次冲量允许的最长持续时间。 */
     const val MAX_PULSE_MS = 45
@@ -42,6 +48,22 @@ object BackTapLogic {
 
     /** 触发后的冷却时间。 */
     const val COOLDOWN_MS = 350L
+
+    /**
+     * 整串连击的**总时长上限**。
+     *
+     * ── 为什么需要它（"不能累积"）──
+     *
+     * 只靠相邻间隔（maxGapMs）判断是不够的：用户可能
+     *   敲 1 下 → 等 250ms → 敲 1 下 → 等 250ms → 敲 1 下
+     * 每一步都在 maxGapMs 之内，于是被凑成"三击" —— 但那其实是三次
+     * 无关的随手敲击（比如把手机放到桌上分三次），不是有意连敲。
+     *
+     * 真正有意的连击，从第一下到最后一下通常不超过 800ms
+     * （两下约 150–300ms，三下约 300–600ms）。
+     * 超过这个跨度就应当作废重计，而不是继续累积。
+     */
+    const val MAX_COMBO_SPAN_MS = 800L
 
     /** 持续运动否决阈值（m/s²，滑动平均）。走路约 1.5~3，静止约 0.05~0.3。 */
     const val MOTION_VETO = 1.1f
@@ -77,7 +99,9 @@ object BackTapLogic {
         val count: Int,
         val need: Int,
         /** 本次是否凑满并触发。 */
-        val triggered: Boolean
+        val triggered: Boolean,
+        /** 触发时的敲击次数：2 = 双击，3 = 三击（未触发时为 0）。 */
+        val taps: Int = 0
     )
 
     /** 灵敏度 1..10：越灵敏 → 阈值越低、允许间隔越宽、置信度门槛越低。 */
@@ -100,6 +124,12 @@ object BackTapLogic {
         private var params = paramsForSensitivity(LEVEL_DEFAULT)
         private var need = 2
 
+        /**
+         * 双模式：双击/三击分开时置 true。
+         * 此时达到 2 次不立即触发，而是等「有没有第 3 次」。
+         */
+        private var dualMode = false
+
         private var motionAvg = 0f
         private var quietSince = 0L
 
@@ -121,9 +151,10 @@ object BackTapLogic {
         var triggers = 0
             private set
 
-        fun configure(params: Params, need: Int) {
+        fun configure(params: Params, need: Int, dual: Boolean = false) {
             this.params = params
             this.need = need.coerceIn(2, 3)
+            this.dualMode = dual
             combo.clear()
             comboPeak.clear()
             comboConf.clear()
@@ -216,14 +247,25 @@ object BackTapLogic {
             }
 
             var restart = false
+            var restartReason = ""
             if (combo.isNotEmpty()) {
                 val gap = now - combo.last()
+                val span = now - combo.first()
                 val lastPeak = comboPeak.last()
                 val ratio = if (lastPeak > 0f) peak / lastPeak else 1f
                 when {
                     gap < MIN_GAP_MS ->
-                        return report(now, peak, confidence, false, "间隔过短")
-                    gap > params.maxGapMs -> restart = true
+                        return report(now, peak, confidence, false, "间隔过短（<${MIN_GAP_MS}ms）")
+                    // 相邻太远 → 重新开始
+                    gap > params.maxGapMs -> {
+                        restart = true
+                        restartReason = "间隔过远"
+                    }
+                    // 整串跨度过长 → 重新开始（防止"隔一会儿敲一下"累积成连击）
+                    span > MAX_COMBO_SPAN_MS -> {
+                        restart = true
+                        restartReason = "整串超时（>${MAX_COMBO_SPAN_MS}ms）"
+                    }
                     ratio < RATIO_MIN || ratio > RATIO_MAX ->
                         return report(now, peak, confidence, false, "幅值差异过大")
                 }
@@ -239,18 +281,36 @@ object BackTapLogic {
             comboConf.add(confidence)
             acceptedTaps++
 
+            // ── 双模式：敲 2 下不立即触发，等「有没有第 3 下」──
+            //
+            // 若立即在 2 下时触发，用户想敲 3 下就会被双击抢占（第 3 下到达时
+            // 双击的服务已经切过去了）。所以双模式下 2 下只报告「计数」，
+            // 真正的判定交给 flush()（由上层在一个 maxGap 之后调用）。
+            if (dualMode) {
+                if (combo.size >= 3) {
+                    triggers++
+                    lastTriggerAt = now
+                    val ev = TapEvent(
+                        at = now, peak = peak, confidence = confidence,
+                        accepted = true, reason = "三击", count = 3, need = 3,
+                        triggered = true, taps = 3
+                    )
+                    combo.clear(); comboPeak.clear(); comboConf.clear()
+                    return ev
+                }
+                return report(
+                    now, peak, confidence, true,
+                    if (restart) "重新计数" else "有效", count = combo.size
+                )
+            }
+
             return if (combo.size >= need) {
                 triggers++
                 lastTriggerAt = now
                 val event = TapEvent(
-                    at = now,
-                    peak = peak,
-                    confidence = confidence,
-                    accepted = true,
-                    reason = "有效",
-                    count = need,
-                    need = need,
-                    triggered = true
+                    at = now, peak = peak, confidence = confidence,
+                    accepted = true, reason = "有效", count = need, need = need,
+                    triggered = true, taps = need
                 )
                 combo.clear()
                 comboPeak.clear()
@@ -259,11 +319,42 @@ object BackTapLogic {
             } else {
                 report(
                     now, peak, confidence, true,
-                    if (restart) "重新计数" else "有效",
+                    if (restart && restartReason.isNotEmpty()) "重新计数（$restartReason）" else "有效",
                     count = combo.size
                 )
             }
         }
+
+        /**
+         * 双模式下由上层定时调用：确认期过去后，若还停在 2 次就判定为双击。
+         *
+         * @param now 当前时刻
+         * @return 触发事件；不需要触发时返回 null
+         */
+        fun flush(now: Long): TapEvent? {
+            if (!dualMode) return null
+            if (combo.size < 2) return null
+            // 距最后一次敲击还不够久 → 继续等（用户可能正在敲第 3 下）
+            if (now - combo.last() < params.maxGapMs) return null
+
+            val taps = combo.size
+            val lastPeak = comboPeak.lastOrNull() ?: 0f
+            val lastConf = comboConf.lastOrNull() ?: 0f
+            val at = combo.last()
+            combo.clear(); comboPeak.clear(); comboConf.clear()
+
+            if (taps != 2) return null
+            triggers++
+            lastTriggerAt = now
+            return TapEvent(
+                at = at, peak = lastPeak, confidence = lastConf,
+                accepted = true, reason = "双击", count = 2, need = 2,
+                triggered = true, taps = 2
+            )
+        }
+
+        /** 双模式下当前是否还挂着未判定的连击（用于上层决定是否继续轮询）。 */
+        fun hasPendingCombo(): Boolean = combo.size >= 2
 
         private fun report(
             now: Long,

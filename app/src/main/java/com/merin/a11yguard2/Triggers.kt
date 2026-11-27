@@ -8,8 +8,17 @@ import android.os.Vibrator
 /** 手势 / 按键 的统一执行层：震动反馈 + 目标服务切换 + 锁屏动作解释。 */
 object Triggers {
 
-    fun vibrate(ctx: Context, ms: Int) {
+    /**
+     * 触觉反馈（默认按「音量键/通用」类别判断开关）。
+     *
+     * 三个提前返回：
+     *   1. ms <= 0：调用方主动要求不震
+     *   2. 全局总开关关闭
+     *   3. 该功能的独立开关关闭
+     */
+    fun vibrate(ctx: Context, ms: Int, kind: String = AppSettings.VIB_VOL) {
         if (ms <= 0) return
+        if (!AppSettings.vibOn(ctx, kind)) return
         runCatching {
             val v = ctx.getSystemService(Vibrator::class.java) ?: return
             if (!v.hasVibrator()) return
@@ -20,6 +29,33 @@ object Triggers {
                 v.vibrate(ms.toLong())
             }
         }
+    }
+
+    /** 屏幕是否处于锁屏状态（含熄屏）。 */
+    private fun isScreenLocked(ctx: Context): Boolean = runCatching {
+        ctx.getSystemService(android.app.KeyguardManager::class.java)?.isKeyguardLocked == true
+    }.getOrDefault(false)
+
+    /**
+     * 把 source 映射到「锁屏开关」的类别，并返回是否允许锁屏执行。
+     *
+     * 映射规则：
+     *   volup / voldown        → 音量键开关
+     *   shake                  → 摇一摇开关
+     *   backtap                → 背面敲击开关
+     *   其它（lock/unlock 等） → 不拦截
+     *
+     * lock/unlock 动作必须放行：它们本身就是"锁屏时要做的事"，
+     * 若被锁屏拦截就永远不生效了。
+     */
+    private fun allowWhenLocked(ctx: Context, source: String): Boolean {
+        val kind = when {
+            source.startsWith("vol") -> AppSettings.LOCK_VOL
+            source == "shake" -> AppSettings.LOCK_SHAKE
+            source == "backtap" -> AppSettings.LOCK_BACKTAP
+            else -> return true
+        }
+        return AppSettings.allowWhenLocked(ctx, kind)
     }
 
     /** 按“取反当前状态”的方式切换一个无障碍服务；在线程里走 Router，失败也有日志。 */
@@ -55,6 +91,15 @@ object Triggers {
      */
     fun runAction(ctx: Context, action: String, source: String) {
         val a = action.trim()
+
+        // ── 锁屏拦截 ──
+        // source 是各手势传入的来源标识（volup/voldown/shake/backtap/...），
+        // 据此判断该手势是否允许在锁屏时执行。
+        if (isScreenLocked(ctx) && !allowWhenLocked(ctx, source)) {
+            Diag.log(source, "锁屏中且该手势未允许锁屏执行 → 跳过")
+            return
+        }
+
         when {
             a.isEmpty() || a == AppSettings.ACT_NONE -> Unit
             a == AppSettings.ACT_MASTER -> {
