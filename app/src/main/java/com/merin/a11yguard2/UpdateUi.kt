@@ -40,21 +40,34 @@ object UpdateUi {
     private const val AUTO_INTERVAL_MS = 12L * 60 * 60 * 1000
 
     /**
-     * 已下载的更新包放在哪。
+     * 更新包放在哪个目录。
      *
-     * 用 `filesDir/updates`，不用 `getExternalFilesDir`：
-     * 后者位于外部存储，某些机型的清理/迁移策略会把它删掉，
-     * 表现为「下载完去授权，回来安装包不见了」。
+     * ══ 为什么要有两条路 ══
      *
-     * 私有目录的代价是用户手动找不到，但我们提供「直接安装」入口，
-     * 不需要他去找文件。
+     * 用户的原话："其实找不到下载的 APK 在哪，你可以在系统的根目录下放着。"
+     *
+     * **Android 10+（API 29）**：走 MediaStore.Downloads，
+     *   文件出现在公共「下载」里，用户用文件管理器能直接看到。
+     *   不需要任何存储权限（Scoped Storage 的福利）。
+     *
+     * **Android 8–9（API 26–28）**：写公共 Downloads 需要
+     *   WRITE_EXTERNAL_STORAGE 权限。为了不多要权限，
+     *   这两个版本写 app 专属外部目录 `Android/data/<pkg>/files/`。
+     *   用户在该路径下能找到（文件管理器需开"显示系统文件"）。
+     *
+     * 两条路的文件都会**同时**保留一份在私有目录，
+     * 因为 FileProvider 只能读自己的目录（系统安装器用它读文件）。
      */
     private fun updateDir(act: Activity): File =
         File(act.filesDir, "updates").apply { mkdirs() }
 
-    /** 某个版本的 APK 路径。 */
+    /** 某个版本在私有目录的 APK 路径（FileProvider 用这个）。 */
     private fun apkFor(act: Activity, ver: String): File =
         File(updateDir(act), "update-$ver.apk")
+
+    /** 下载目标在外部存储的路径（用户能看到的那个）。 */
+    private fun publicApkPath(act: Activity, ver: String): String =
+        "a11yguard2-更新-$ver.apk"
 
     /** 已下载完成、可安装的 APK（若存在）。 */
     fun pendingApk(act: Activity, ver: String): File? {
@@ -63,15 +76,83 @@ object UpdateUi {
     }
 
     /**
+     * 下载完成后，把文件同时复制一份到用户可见的位置。
+     *
+     * @return 用户可见位置的描述（写进 Toast，告诉他去哪找）
+     */
+    private fun makeUserVisibleCopy(act: Activity, src: File, ver: String): String {
+        val displayName = publicApkPath(act, ver)
+
+        // Android 10+：MediaStore.Downloads，不需要权限
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val ok = runCatching {
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE,
+                        "application/vnd.android.package-archive")
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+                        android.os.Environment.DIRECTORY_DOWNLOADS)
+                    put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val resolver = act.contentResolver
+                val uri = resolver.insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                ) ?: return@runCatching false
+
+                resolver.openOutputStream(uri)?.use { out ->
+                    src.inputStream().use { it.copyTo(out) }
+                } ?: return@runCatching false
+
+                values.clear()
+                values.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+                true
+            }.getOrDefault(false)
+            if (ok) {
+                Diag.log("update", "已复制到公共下载：$displayName")
+                return "下载目录（文件管理 → 下载 → $displayName）"
+            }
+        }
+
+        // Android 8–9：写 app 专属外部目录，无需权限
+        val ok = runCatching {
+            val base = act.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+                ?: act.getExternalFilesDir(null) ?: return@runCatching false
+            base.mkdirs()
+            val dst = File(base, displayName)
+            src.inputStream().use { ins ->
+                dst.outputStream().use { out -> ins.copyTo(out) }
+            }
+            true
+        }.getOrDefault(false)
+
+        return if (ok) {
+            Diag.log("update", "已复制到 app 外部目录：$displayName")
+            "Android/data/${act.packageName}/files/Download/$displayName"
+        } else {
+            "应用私有目录（用本应用的「立即安装」按钮）"
+        }
+    }
+
+    /**
      * 清理旧版本残留的 APK。
      *
-     * 下载新版本时调用，避免私有目录越积越大（也不会误删当前版本）。
+     * 下载新版本时调用，避免目录越积越大（不会误删当前版本）。
      */
     private fun cleanupOldApks(act: Activity, keepVer: String) {
         runCatching {
             updateDir(act).listFiles()?.forEach { f ->
                 if (f.isFile && !f.name.contains(keepVer)) f.delete()
             }
+            // 外部目录（8–9 用）也清理
+            act.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+                ?.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.startsWith("a11yguard2-更新-") &&
+                        !f.name.contains(keepVer)
+                    ) {
+                        f.delete()
+                    }
+                }
         }
     }
 
@@ -415,6 +496,12 @@ object UpdateUi {
                         dst.delete()
                         return@post
                     }
+                    // 同时复制一份到用户能找到的位置，并告知路径。
+                    // 用户的原话是"找不到下载的 APK 在哪"，所以下载完必须
+                    // 明确告诉他文件在哪，而不是只弹出安装界面。
+                    val where = makeUserVisibleCopy(act, dst, ver)
+                    Diag.log("update", "安装包位置：$where")
+                    toast(act, "下载完成，已保存到 $where")
                     installApk(act, dst)
                 }
             } catch (e: Exception) {
