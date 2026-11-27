@@ -1,6 +1,6 @@
 {
-  "versionCode": 11200,
-  "versionName": "2.2.0",
-  "notes": "无障碍守护 2.2.0\n\n· 修复摇一摇「手机一动就触发」：阈值 350→1200\n· 新增灵敏度档位 1–10（可自行调难易）\n· 每个手势独立震动开关与时长\n· 每个手势独立「锁屏时是否响应」\n· 音量键窗口改为总时长语义（100–600ms）\n· 摇动次数可选 1–10 次\n· 界面 Material 3 化",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v2.2.0/a11yguard2-2.2.0.apk"
+  "versionCode": 11300,
+  "versionName": "2.3.0",
+  "notes": "无障碍守护 2.3.0\n\n· 摇一摇两段式震动：累计中弱震、触发时强震（都可调/可关）\n· 锁屏/解锁改为「确保开启」：服务正常时不动，崩了才拉起\n· 修复：之前锁屏会把服务关掉、亮屏再打开，读屏反复中断\n· 默认配置即自愈，无需手动设置\n· 125 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v2.3.0/a11yguard2-2.3.0.apk"
 }
