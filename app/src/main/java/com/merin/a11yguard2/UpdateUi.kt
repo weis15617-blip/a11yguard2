@@ -1,5 +1,6 @@
 package com.merin.a11yguard2
 
+import android.provider.Settings
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
@@ -290,7 +291,56 @@ object UpdateUi {
     }
 
     /** 用系统安装器打开 APK（不静默安装）。 */
+    /**
+     * 调起系统安装器。
+     *
+     * ── 为什么"点了没反应"很常见 ──
+     *
+     * 从 Android 8 开始，用 Intent 装 APK 需要两个前提：
+     *   1. 清单里声明 REQUEST_INSTALL_PACKAGES（本应用早期漏了，导致完全调不起来）
+     *   2. **用户手动**在系统设置里给本应用开「安装未知应用」权限
+     *
+     * 第 2 条无法用代码绕过（那是安全边界）。所以这里做三件事：
+     *   · 先检查权限，没开就弹窗引导，并直接跳到那个设置页
+     *   · 调起失败时区分"没权限"与"其它错误"，给不同提示
+     *   · 保留 FileProvider URI 方式（不能直接用 file:// ，Android 7+ 禁止）
+     */
     private fun installApk(act: Activity, apk: File) {
+        // Android 8+ 需要"安装未知应用"权限
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val pm = act.packageManager
+            if (!pm.canRequestPackageInstalls()) {
+                Diag.log("update", "缺少「安装未知应用」权限，引导用户开启")
+                AlertDialog.Builder(act)
+                    .setTitle("需要允许安装应用")
+                    .setMessage(
+                        "系统要求先授权「安装未知应用」，才能由本应用调起安装器。\n\n"
+                            + "点「去开启」后，在列表里找到「无障碍守护」，打开开关，"
+                            + "然后回来重新点「下载并安装」。"
+                    )
+                    .setPositiveButton("去开启") { _, _ ->
+                        runCatching {
+                            act.startActivity(
+                                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                                    .setData(Uri.parse("package:" + act.packageName))
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            )
+                        }.onFailure {
+                            // 部分 ROM 不认带 package 的 URI，退回总列表
+                            runCatching {
+                                act.startActivity(
+                                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }.onFailure { toast(act, "无法打开设置页，请手动到「设置 → 应用 → 特殊权限」里开启") }
+                        }
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+                return
+            }
+        }
+
         runCatching {
             val uri: Uri = ApkFileProvider.uriFor(act, apk)
             val i = Intent(Intent.ACTION_VIEW).apply {
@@ -301,8 +351,16 @@ object UpdateUi {
             act.startActivity(i)
             toast(act, "请在弹出的安装界面确认")
         }.onFailure {
-            Diag.log("update", "install failed: ${it.message}")
-            toast(act, "无法调起安装器：" + (it.message ?: ""))
+            Diag.log("update", "install failed: ${it.javaClass.simpleName}: ${it.message}")
+            val msg = it.message.orEmpty()
+            toast(
+                act,
+                if (msg.contains("ActivityNotFound", true) || msg.contains("No Activity", true)) {
+                    "找不到安装器。请到「设置 → 应用 → 特殊权限 → 安装未知应用」里允许本应用，或手动用文件管理器打开下载好的 APK。"
+                } else {
+                    "无法调起安装器：" + msg
+                }
+            )
         }
     }
 

@@ -1006,9 +1006,14 @@ class MainActivity : AppCompatActivity() {
         }
         ll.addView(cardWrap(shakeSw))
 
+        // 注意：配置项**始终显示**，不因为开关关闭而隐藏。
+        // 早期版本把整块配置放在 else 分支里，导致用户开着开关时配好了、
+        // 关掉开关就再也看不到「摇动次数」「目标服务」——
+        // 表现为「摇一摇次数不能设定」（其实是整个配置区被隐藏了）。
         if (!AppSettings.shakeOn(this)) {
-            ll.addView(hint("摇一摇已关闭。打开后需要选一个目标服务。"))
-        } else {
+            ll.addView(hint("摇一摇当前已关闭。下面的参数可以先调好，打开开关即生效。"))
+        }
+        run {
             ll.addView(cardWrap(selectorRow(
                 "摇一摇灵敏度",
                 shakeSensitivityLabel()

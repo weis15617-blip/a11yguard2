@@ -113,6 +113,25 @@ object ShakeLogic {
     /** 判定为一次摇动所需的连续超阈值次数（原实现的 SHAKE_COUNT）。 */
     const val SHAKE_COUNT = 3
 
+    /**
+     * 比例判据窗口（毫秒）。参考 Square Seismic：用「最近 500ms 内超阈值采样占比」
+     * 判定是否正在摇动，比「连续 N 次超阈值」稳健得多。
+     */
+    const val RATIO_WINDOW_MS = 500L
+
+    /**
+     * 窗口内超阈值采样占比达到此值即认为「正在摇动」。
+     *
+     * Seismic 用 75%。含义：
+     *   · 真实甩动时手在持续加速，窗口内大部分采样都超阈值 → 占比高
+     *   · 单次碰撞只有一个尖峰 → 占比很低（1/25 ≈ 4%）
+     *   · 走路晃动虽有波动，但大部分采样在阈值以下 → 占比中等
+     *
+     * 这就是为什么它比「连续计数」更可靠：单点特征容易被碰撞骗过，
+     * 而「持续比例」必须真的持续用力才能满足。
+     */
+    const val HOT_RATIO = 0.75f
+
     /** 兼容旧命名。 */
     const val GRAVITY = 9.8f
 
@@ -135,7 +154,13 @@ object ShakeLogic {
         /** 上一次算出的 speed（诊断） */
         val lastSpeed: Float = 0f,
         /** 本轮的峰值 speed（诊断） */
-        val peakSpeed: Float = 0f
+        val peakSpeed: Float = 0f,
+
+        /** 滑动窗口缓冲：每个元素是 (时刻, 是否超阈值) */
+        val window: List<Pair<Long, Boolean>> = emptyList(),
+
+        /** 当前窗口内的热采样占比（诊断） */
+        val hotRatio: Float = 0f
     )
 
     enum class Verdict {
@@ -158,7 +183,13 @@ object ShakeLogic {
         /** 本次算出的变化率 */
         val speed: Float = 0f,
         /** 当前累计次数 */
-        val count: Int = 0
+        val count: Int = 0,
+        /** 本轮峰值变化率（诊断） */
+        val peakSpeed: Float = 0f,
+        /** 滑动窗口内容（诊断） */
+        val window: List<Pair<Long, Boolean>> = emptyList(),
+        /** 窗口内热采样占比（诊断） */
+        val hotRatio: Float = 0f
     )
 
     /**
@@ -166,6 +197,28 @@ object ShakeLogic {
      *
      * 注意：经典算法用的是**原始三轴之和的差**，所以传入含重力的原始值即可，
      * 不需要去重力 —— 因为重力是常量，在差分时抵消了。
+     */
+    /**
+     * 处理一个加速度采样。
+     *
+     * ══ 两重判据（融合业界两种成熟做法）══
+     *
+     * **判据 A：比例判据**（Square Seismic）
+     *   最近 [RATIO_WINDOW_MS] 内，超阈值采样占比 >= [HOT_RATIO] → 认为"正在摇动"
+     *
+     *   为什么需要它：单点特征容易被碰撞骗过。Seismic 的洞察是
+     *   「持续用力」才是摇动的本质 —— 真甩时窗口内大部分采样都超阈值，
+     *   而一次碰撞只占 1/25，占比很低。
+     *
+     * **判据 B：连续计数**（Matthew Wiggins 经典实现）
+     *   连续 [needCount] 次超阈值 → 计一次摇动
+     *
+     * 两者同时满足才判定为一次摇动。这样：
+     *   · 碰撞：比例不足（A 挡）且次数不够（B 挡）→ 拒绝
+     *   · 放桌上震一下：同上 → 拒绝
+     *   · 真甩：比例高 + 次数够 → 通过
+     *
+     * 用 A 补 B 的「阈值敏感」，用 B 补 A 的「次数可控」（用户可设 1-10 次）。
      */
     fun step(
         st: State,
@@ -176,17 +229,18 @@ object ShakeLogic {
         forceThreshold: Float = DEFAULT_FORCE_THRESHOLD,
         needCount: Int = SHAKE_COUNT
     ): Step {
-        // 超时清零：太久没有动作，之前的累计作废
+        // 超时清零
         var shakeCount = st.shakeCount
         if (st.lastForce > 0 && now - st.lastForce > SHAKE_TIMEOUT) {
             shakeCount = 0
         }
 
-        // 采样间隔太短：跳过（避免 Δt≈0）
+        // 采样间隔太短：跳过（避免 Δt≈0 导致 speed 爆炸）
         if (st.lastTime > 0 && now - st.lastTime <= TIME_THRESHOLD) {
             return Step(
                 st.copy(shakeCount = shakeCount, lastSpeed = 0f),
-                false, Verdict.SKIPPED, 0f, shakeCount
+                false, Verdict.SKIPPED, 0f, shakeCount,
+                st.peakSpeed, st.window, st.hotRatio
             )
         }
 
@@ -196,25 +250,38 @@ object ShakeLogic {
                 st.copy(
                     shakeCount = 0, lastTime = now,
                     lastX = x, lastY = y, lastZ = z,
-                    lastSpeed = 0f, peakSpeed = 0f
+                    lastSpeed = 0f, peakSpeed = 0f,
+                    window = emptyList(), hotRatio = 0f
                 ),
-                false, null, 0f, 0
+                false, null, 0f, 0, 0f, emptyList(), 0f
             )
         }
 
         val diff = now - st.lastTime
         val delta = abs(x + y + z - st.lastX - st.lastY - st.lastZ)
         val speed = delta / diff.toFloat() * 10000f
+        val hot = speed > forceThreshold
+
+        // ── 维护滑动窗口（判据 A 的数据来源）──
+        val kept = st.window.filter { now - it.first <= RATIO_WINDOW_MS }
+        val window = kept + (now to hot)
+        val hotRatio = if (window.isEmpty()) 0f
+        else window.count { it.second }.toFloat() / window.size
 
         var lastForce = st.lastForce
         var lastShake = st.lastShake
         var triggered = false
         var verdict: Verdict
 
-        if (speed > forceThreshold) {
+        if (hot) {
             shakeCount++
             lastForce = now
-            if (shakeCount >= needCount.coerceAtLeast(1)) {
+
+            // 判据 A：比例达标才允许计数推进
+            val ratioOk = hotRatio >= HOT_RATIO || window.size < 4
+            // （窗口太小时比例无意义，前几个采样直接放行，靠 B 兜住）
+
+            if (shakeCount >= needCount.coerceAtLeast(1) && ratioOk) {
                 if (now - lastShake > SHAKE_DURATION) {
                     lastShake = now
                     shakeCount = 0
@@ -227,6 +294,10 @@ object ShakeLogic {
                 verdict = Verdict.COUNTING
             }
         } else {
+            // 比例不足时也把计数回退一点，避免「夹着断点仍累加」凑满
+            if (hotRatio < HOT_RATIO * 0.5f && shakeCount > 0) {
+                shakeCount = (shakeCount - 1).coerceAtLeast(0)
+            }
             verdict = Verdict.TOO_SLOW
         }
 
@@ -237,8 +308,10 @@ object ShakeLogic {
             lastForce = lastForce,
             lastShake = lastShake,
             lastSpeed = speed,
-            peakSpeed = maxOf(st.peakSpeed, speed)
+            peakSpeed = maxOf(st.peakSpeed, speed),
+            window = window,
+            hotRatio = hotRatio
         )
-        return Step(ns, triggered, verdict, speed, shakeCount)
+        return Step(ns, triggered, verdict, speed, shakeCount, ns.peakSpeed, window, hotRatio)
     }
 }

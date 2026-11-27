@@ -41,6 +41,14 @@ class BackTapWatcher(
 
     private var registered = false
     private var currentPeriodUs = 0
+
+    /** 陀螺仪（用于否决"推/碰"，参考 Google Columbus 的双传感器设计）。 */
+    private var gyro: Sensor? = null
+    private var gyroRegistered = false
+
+    /** 最近一次角速度模长（rad/s），由陀螺仪回调写入。 */
+    @Volatile
+    private var lastGyroMag = 0f
     private var screenReceiver: BroadcastReceiver? = null
     private var screenOn = true
     private var allowScreenOff = false
@@ -144,14 +152,43 @@ class BackTapWatcher(
             sm?.registerListener(this, sensor, period) ?: false
         }.getOrDefault(false)
         currentPeriodUs = if (registered) period else 0
+
+        // 陀螺仪：与加速度计同时注册（Google Columbus 的做法）。
+        // 它只用于"否决"，不参与置信度计算，所以采样率可以低一些。
+        registerGyro(period)
+
         if (!screenOn && allowScreenOff) acquireWakeLock() else releaseWakeLock()
     }
 
+    /**
+     * 注册陀螺仪。
+     *
+     * 有则启用角速度否决，没有则静默降级（gyroAvailable=false，
+     * 判定逻辑自动跳过否决），不会影响基本功能。
+     */
+    private fun registerGyro(periodUs: Int) {
+        if (gyroRegistered) return
+        val g = sm?.getDefaultSensor(Sensor.TYPE_GYROSCOPE) ?: run {
+            detector.setGyroAvailable(false)
+            Diag.log("backtap", "无陀螺仪 → 跳过角速度否决（仅用加速度计）")
+            return
+        }
+        gyro = g
+        gyroRegistered = runCatching {
+            sm?.registerListener(this, g, periodUs) ?: false
+        }.getOrDefault(false)
+        detector.setGyroAvailable(gyroRegistered)
+        Diag.log("backtap", "陀螺仪 registered=$gyroRegistered 否决阈值=${BackTapLogic.GYRO_VETO}")
+    }
+
     private fun unregister() {
-        if (!registered) return
+        if (!registered && !gyroRegistered) return
+        // 同一个 SensorEventListener 注册了两个传感器，一次注销即可全部移除
         runCatching { sm?.unregisterListener(this) }
         registered = false
+        gyroRegistered = false
         currentPeriodUs = 0
+        lastGyroMag = 0f
     }
 
     private fun acquireWakeLock() {
@@ -211,8 +248,16 @@ class BackTapWatcher(
     override fun onSensorChanged(event: SensorEvent?) {
         val e = event ?: return
         val v = e.values
+
+        // 陀螺仪事件：只记录角速度，不参与冲量判定
+        if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
+            lastGyroMag = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            return
+        }
+        if (e.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+
         val deviation = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - BackTapLogic.GRAVITY
-        val ev = detector.feed(SystemClock.elapsedRealtime(), deviation) ?: return
+        val ev = detector.feed(SystemClock.elapsedRealtime(), deviation, lastGyroMag) ?: return
         onEvent(ev)
         if (ev.accepted && !ev.triggered && vibMs > 0) {
             Triggers.vibrate(ctx, vibMs, AppSettings.VIB_TAP)

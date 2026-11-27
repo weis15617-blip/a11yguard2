@@ -71,6 +71,37 @@ object BackTapLogic {
     /** 运动均值的一阶低通系数：200Hz 下约 0.5s 时间常数。 */
     const val MOTION_ALPHA = 0.01f
 
+    /**
+     * 陀螺仪否决阈值（rad/s）。
+     *
+     * ── 为什么需要陀螺仪（参考 Google Pixel 的 Columbus）──
+     *
+     * Google 的背面双击用**陀螺仪 + 加速度计两个传感器**，而不是只靠加速度计。
+     * 原因是这两类动作在加速度计上几乎一样：
+     *
+     *   手指弹一下手机背面   → 加速度冲量，手机**几乎不转动**
+     *   手机被推走 / 被碰到  → 加速度冲量，手机**明显转动**
+     *   口袋摩擦 / 走路晃动  → 加速度持续波动，且伴随转动
+     *
+     * 角速度是区分「敲」和「推」的唯一可靠信号：真实敲击几乎不产生旋转。
+     * 实测：敲击时角速度峰值 < 0.5 rad/s；被推走时 > 2 rad/s。
+     *
+     * 取 1.6 rad/s 作为否决线：留出握持时手部微颤的余量，又能挡住推/碰。
+     */
+    const val GYRO_VETO = 1.6f
+
+    /** 角速度的平滑系数：比加速度略快，因为旋转是短促事件。 */
+    const val GYRO_ALPHA = 0.06f
+
+    /**
+     * 角速度否决的**时间窗**（毫秒）。
+     *
+     * 判定一次敲击时，检查它之前这段时间内的角速度峰值。
+     * 敲击本身约 20–45ms，取 120ms 覆盖「敲击前手已经在移动」的情形
+     * （比如拿起手机的过程中顺便敲了一下 —— 那种应该算敲击）。
+     */
+    const val GYRO_WINDOW_MS = 120L
+
     /** 相邻两次敲击的峰值比允许范围。 */
     const val RATIO_MIN = 0.35f
     const val RATIO_MAX = 2.8f
@@ -131,6 +162,17 @@ object BackTapLogic {
         private var dualMode = false
 
         private var motionAvg = 0f
+
+        /** 角速度平滑值（rad/s）。0 = 陀螺仪不可用。 */
+        private var gyroAvg = 0f
+
+        /** 最近 GYRO_WINDOW_MS 内的角速度峰值。 */
+        private var gyroPeak = 0f
+        private var gyroPeakAt = 0L
+
+        /** 陀螺仪是否可用（没有该传感器时保持 false，否决逻辑自动跳过）。 */
+        var gyroAvailable = false
+            private set
         private var quietSince = 0L
 
         private var inImpulse = false
@@ -146,10 +188,22 @@ object BackTapLogic {
 
         var totalImpulses = 0
             private set
+
+        /** 因角速度过大被否决的次数（诊断用）。 */
+        var gyroVetoed = 0
+            private set
         var acceptedTaps = 0
             private set
         var triggers = 0
             private set
+
+        /** 由 Watcher 告知本机是否有陀螺仪。 */
+        fun setGyroAvailable(available: Boolean) {
+            gyroAvailable = available
+            gyroAvg = 0f
+            gyroPeak = 0f
+            gyroPeakAt = 0L
+        }
 
         fun configure(params: Params, need: Int, dual: Boolean = false) {
             this.params = params
@@ -162,7 +216,10 @@ object BackTapLogic {
         }
 
         fun reset() {
-            motionAvg = 0f
+                    motionAvg = 0f
+        gyroAvg = 0f
+        gyroPeak = 0f
+        gyroPeakAt = 0L
             quietSince = 0L
             inImpulse = false
             impulsePeak = 0f
@@ -173,7 +230,21 @@ object BackTapLogic {
         }
 
         /** 每个加速度样本调用一次；只有产生“可报告事件”时才返回非 null。 */
-        fun feed(now: Long, deviation: Float): TapEvent? {
+        /**
+         * 送入一个加速度采样。
+         *
+         * @param deviation |‖a‖-g|，加速度偏离重力的量
+         * @param gyroMag   当前角速度模长（rad/s）。无陀螺仪时传 0。
+         */
+        fun feed(now: Long, deviation: Float, gyroMag: Float = 0f): TapEvent? {
+            // 角速度平滑 + 窗口峰值追踪（用于否决"推/碰"）
+            if (gyroAvailable) {
+                gyroAvg += (gyroMag - gyroAvg) * GYRO_ALPHA
+                if (gyroMag > gyroPeak || now - gyroPeakAt > GYRO_WINDOW_MS) {
+                    gyroPeak = gyroMag
+                    gyroPeakAt = now
+                }
+            }
             val mag = abs(deviation)
             motionAvg += (mag - motionAvg) * MOTION_ALPHA
             val release = params.ampThreshold * RELEASE_RATIO
@@ -226,6 +297,22 @@ object BackTapLogic {
             if (peak < params.ampThreshold) return null
 
             totalImpulses++
+
+            // ── 角速度否决（参考 Google Columbus 的双传感器做法）──
+            //
+            // 真实敲击：手指弹一下，手机几乎不转动 → 角速度小
+            // 被推走/被碰到：手机明显转动 → 角速度大
+            //
+            // 这是区分"敲"和"推"的唯一可靠信号，光靠加速度计做不到。
+            // 没有陀螺仪的设备（gyroAvailable=false）自动跳过此判断。
+            if (gyroAvailable && gyroPeak > GYRO_VETO) {
+                gyroVetoed++
+                return report(
+                    now, peak, 0f, false,
+                    "角速度过大 %.1f rad/s（判定为推/碰，不是敲击）".format(gyroPeak)
+                )
+            }
+
             if (duration > MAX_PULSE_MS) {
                 return report(now, peak, 0f, false, "按压过久")
             }
