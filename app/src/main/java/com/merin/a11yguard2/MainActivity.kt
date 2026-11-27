@@ -1,5 +1,6 @@
 package com.merin.a11yguard2
 
+import android.text.InputType
 import android.app.Activity
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -1808,6 +1809,21 @@ class MainActivity : AppCompatActivity() {
         }))
         ll.addView(cardWrap(clickRow("我已执行，检测授权") { checkSecurePermission(true) }))
 
+        // ── 粘贴命令窗口 ──
+        //
+        // 用户从教程里复制了 adb 命令，可以直接粘到这里：
+        //   · 已生效 → 立即显示成功
+        //   · 未生效 → 解析并给出不用电脑的替代路径
+        //
+        // 为什么不能"粘贴就执行"：执行 pm grant 需要 shell 权限，
+        // 而 App 正是缺这个权限才需要它 —— 逻辑上绕不回来。
+        ll.addView(cardWrap(clickRow("粘贴授权命令") { showGrantCommandWindow() }))
+        ll.addView(hint(
+            "从电脑上执行完那条 adb 命令后，可以把命令粘到这里 —— "
+                + "本应用会立即检测是否生效。若你的设备不方便连电脑，"
+                + "窗口里也给了不用电脑的替代方案。"
+        ))
+
         ll.addView(sectionTitle("快捷触发（需「点按代理」服务运行）"))
         val volSw = MaterialSwitch(this).apply {
             text = "音量键启动（双击音量上/下键）"
@@ -1831,6 +1847,23 @@ class MainActivity : AppCompatActivity() {
         ll.addView(cardWrap(shizukuStateRow!!))
         ll.addView(cardWrap(clickRow("申请 Shizuku 授权（弹系统确认框）") { requestShizuku() }))
         ll.addView(cardWrap(clickRow("打开 Shizuku 应用") { openShizukuApp() }))
+        ll.addView(cardWrap(clickRow("Shizuku 怎么激活（不用电脑）") { showShizukuGuide() }))
+
+        // 状态可能随时变（用户去激活了），给一个立即刷新的入口，
+        // 不必等 1.2 秒的轮询。
+        ll.addView(cardWrap(clickRow("立即检测 Shizuku 状态") {
+            shizukuStateRow?.text = "Shizuku 状态：" + shizukuText()
+            val st = ToggleRouter.shizukuStatus(this)
+            toast(
+                when (st) {
+                    RouteLogic.SHIZUKU_AVAILABLE -> "Shizuku 可用"
+                    RouteLogic.SHIZUKU_NOT_INSTALLED -> "未安装 Shizuku 管理端"
+                    RouteLogic.SHIZUKU_NOT_RUNNING -> "Shizuku 服务未运行，需要激活"
+                    RouteLogic.SHIZUKU_NO_PERMISSION -> "已运行但未授权，请点「申请授权」"
+                    else -> "状态：" + st
+                }
+            )
+        }))
         ll.addView(cardWrap(clickRow("一键保活（守护服务 + 加锁服务）") {
             Keepalive.start(this)
             toast("已请求保活；正在修复掉线服务")
@@ -2523,7 +2556,145 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun editAlias(comp: String, fallback: String) {
+    /**
+     * 粘贴授权命令的窗口。
+     *
+     * 支持的交互：
+     *   · 一键读取剪贴板（比手动长按粘贴快）
+     *   · 手动粘贴/编辑
+     *   · 点「检测」→ 解析命令 + 检查权限是否已生效
+     *   · 未生效时给三条不用电脑的替代路径
+     */
+    private fun showGrantCommandWindow() {
+        val ll = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+        }
+
+        val box = EditText(this).apply {
+            hint = "adb shell pm grant com.merin.a11yguard2 android.permission.WRITE_SECURE_SETTINGS"
+            setText("")
+            setSingleLine(false)
+            minLines = 3
+            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            textSize = 12f
+            typeface = android.graphics.Typeface.MONOSPACE
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        ll.addView(box)
+
+        val resultTv = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor(SUB))
+            setPadding(0, dp(10), 0, 0)
+        }
+        ll.addView(resultTv)
+
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("授权命令")
+            .setMessage("把电脑上执行过的 adb 命令粘贴进来，点「检测」看是否已生效。")
+            .setView(ScrollView(this).apply { addView(ll) })
+            .setPositiveButton("检测") { _, _ -> checkPastedCommand(box.text.toString(), resultTv) }
+            .setNeutralButton("读剪贴板") { _, _ ->
+                val cm = getSystemService(ClipboardManager::class.java)
+                val clip = cm?.primaryClip
+                val text = if (clip != null && clip.itemCount > 0) {
+                    clip.getItemAt(0).coerceToText(this).toString()
+                } else ""
+                if (text.isEmpty()) {
+                    toast("剪贴板为空")
+                } else {
+                    box.setText(text)
+                    checkPastedCommand(text, resultTv)
+                }
+            }
+            .setNegativeButton("关闭", null)
+            .create()
+        dialog.show()
+
+        // 打开时若已授权，直接提示
+        if (ToggleRouter.secureAvailable(this)) {
+            resultTv.text = "✓ 直写权限已生效，不需要再执行命令。"
+            resultTv.setTextColor(Color.parseColor(GREEN))
+        }
+    }
+
+    /** 解析粘贴的命令并检测权限状态。 */
+    private fun checkPastedCommand(raw: String, resultTv: TextView) {
+        val parsed = GrantCommandParser.parse(raw, packageName)
+
+        // 无论命令长什么样，先看真实权限状态（用户可能已经执行过了）
+        val granted = ToggleRouter.secureAvailable(this)
+        Diag.log("perm", "pasted command parsed=${parsed.isOurGrant} granted=$granted")
+
+        if (!parsed.isOurGrant) {
+            resultTv.setTextColor(Color.parseColor(ORANGE))
+            resultTv.text = parsed.message
+            return
+        }
+
+        if (granted) {
+            resultTv.setTextColor(Color.parseColor(GREEN))
+            resultTv.text = "✓ 解析成功，且权限**已生效**。\n\n" +
+                "现在切换无障碍服务会走「直写」路径：瞬间完成、不闪设置页、重启手机后仍有效。"
+            refreshState()
+            window.decorView.post { invalidateCurrentPage() }
+        } else {
+            resultTv.setTextColor(Color.parseColor(ORANGE))
+            resultTv.text = "命令格式正确，但权限**尚未生效**。\n\n" +
+                "如果你刚在电脑上执行完，稍等 5 秒再点一次「检测」。\n\n" +
+                "如果没电脑 / 不想连电脑，可以用下面的替代路径：\n" +
+                "  · Shizuku（全程手机内，推荐）\n" +
+                "  · root（已 root 的设备）\n" +
+                "  · 点按模式（只需无障碍授权，已内建）"
+        }
+    }
+
+        /**
+     * Shizuku 激活引导。
+     *
+     * 重点讲**不用电脑**的方法：Android 11+ 的无线调试。
+     * 这是普通用户唯一可行的路 —— 让他装 adb、开 USB 调试太劝退。
+     */
+    private fun showShizukuGuide() {
+        val msg = """
+            不用电脑的激活方法（Android 11 及以上）：
+
+            ① 先去装 Shizuku（应用商店或官网）。
+            ② 打开手机「开发者选项」→ 打开「无线调试」。
+            ③ 回到 Shizuku，选「通过无线调试启动」。
+            ④ 按 Shizuku 的提示，在「无线调试」里选「使用配对码配对设备」，
+               把 6 位配对码填进 Shizuku。
+            ⑤ Shizuku 显示「已激活」后，回到本应用点「申请 Shizuku 授权」。
+
+            ─────────────
+
+            注意事项：
+            · 手机重启后 Shizuku 会失效，需要重新激活一次
+              （这也是为什么「直写」更适合长期使用）。
+            · 如果你的设备已 root，直接用 root 方式更省事，
+              不需要 Shizuku。
+            · 如果这两条路都不方便，用「点按」方式也能工作 ——
+              只需要无障碍授权，切换时会短暂显示系统设置页。
+        """.trimIndent()
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Shizuku 激活引导")
+            .setMessage(msg)
+            .setPositiveButton("知道了", null)
+            .setNeutralButton("打开开发者选项") { _, _ ->
+                runCatching {
+                    startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS
+                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }.onFailure { toast("无法打开开发者选项") }
+            }
+            .show()
+    }
+
+        private fun editAlias(comp: String, fallback: String) {
         val cur = AppSettings.aliasMap(this)[SvcRepo.normalize(comp)].orEmpty()
         val box = EditText(this).apply {
             setText(cur)

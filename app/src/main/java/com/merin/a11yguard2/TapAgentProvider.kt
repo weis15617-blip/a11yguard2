@@ -22,10 +22,14 @@ class TapAgentProvider : ToggleProvider {
             ?: return ToggleResult(route, comp, false, false, false, "无障碍授权未开启（点按代理未连接）")
         val label = SvcRepo.labelOf(ctx, comp)
         Diag.log("tap", "start target=$comp label=$label want=$want")
+        // 无动画打开：避免设置页"滑出"的视觉冲击。
+        // 点按模式本来就要借系统设置页，动画越少越不像在跳转。
         val started = runCatching {
             ctx.startActivity(
                 Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    .addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
             )
         }.isSuccess
         if (!started) return ToggleResult(route, comp, false, false, false, "无法打开系统无障碍设置")
@@ -54,6 +58,24 @@ class TapAgentProvider : ToggleProvider {
         if (want) confirmDialog(svc)
         val ok = pollVerify(ctx, comp, want, 3000)
         Diag.log("tap", "done verify=$ok")
+
+        // 切换完成后模拟返回，把系统设置页退掉，回到用户原来的界面。
+        // 无障碍服务不能直接 finish 别人的 Activity，但 performGlobalAction(BACK)
+        // 是标准能力，效果等价且不依赖 Activity 上下文。
+        if (ok) {
+            val back = runCatching {
+                svc.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+            }.getOrDefault(false)
+            Diag.log("tap", "auto-back=$back")
+            // 再退一次：有些机型设置页是两层（列表 + 详情），要退两下
+            if (back) {
+                SystemClock.sleep(300)
+                runCatching {
+                    svc.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+                }
+            }
+        }
+
         return ToggleResult(route, comp, true, true, ok, if (ok) null else "回读设置未变化")
     }
 
