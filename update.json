@@ -1,6 +1,6 @@
 {
-  "versionCode": 12200,
-  "versionName": "3.2.0",
-  "notes": "无障碍守护 3.2.0\n\n· 修复：下载前先检查安装权限，不会白下载 5MB 才发现要授权\n· 修复：下载完的安装包改存私有目录，不会「不见了」\n· 新增：已下载过则按钮变成「立即安装（已下载）」，不联网\n· 新增：HTTP Range 断点续传，中断后不用从头下\n· 133 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.2.0/a11yguard2-3.2.0.apk"
+  "versionCode": 12210,
+  "versionName": "3.2.1",
+  "notes": "无障碍守护 3.2.1\n\n· 修复：更新包另存一份到公共下载目录，用户能在文件管理器里找到\n· Android 10+ 走 MediaStore.Downloads（无需存储权限）\n· 下载完成 Toast 明确告知文件路径\n· 保留私有目录副本供系统安装器读取\n· 133 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.2.1/a11yguard2-3.2.1.apk"
 }
