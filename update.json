@@ -1,6 +1,6 @@
 {
-  "versionCode": 12100,
-  "versionName": "3.1.0",
-  "notes": "无障碍守护 3.1.0\n\n· 点按模式：无动画跳转 + 切换后自动返回原界面\n· 新增「粘贴授权命令」窗口：检测权限是否生效、指出格式错误、给出不用电脑的替代方案\n· 新增 Shizuku 激活引导（不用电脑的无线调试法）\n· 新增「立即检测 Shizuku 状态」按钮\n· 133 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.1.0/a11yguard2-3.1.0.apk"
+  "versionCode": 12200,
+  "versionName": "3.2.0",
+  "notes": "无障碍守护 3.2.0\n\n· 修复：下载前先检查安装权限，不会白下载 5MB 才发现要授权\n· 修复：下载完的安装包改存私有目录，不会「不见了」\n· 新增：已下载过则按钮变成「立即安装（已下载）」，不联网\n· 新增：HTTP Range 断点续传，中断后不用从头下\n· 133 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.2.0/a11yguard2-3.2.0.apk"
 }
