@@ -1,6 +1,6 @@
 {
-  "versionCode": 12300,
-  "versionName": "3.3.0",
-  "notes": "无障碍守护 3.3.0\n\n· 修复：关闭服务后立刻又开启（改用幂等 off: 语义）\n· 修复：说短名没反应（自动生成「解说」等短名变体）\n· 修复：权限弹窗「保持开启」点不掉（补 canPerformGestures + 模拟点击）\n· 跨机型：服务行三级匹配、找不到时 dump 候选、助手包名动态扫描\n· 危险按钮保护：绝不误点「关闭无障碍」\n· 133 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.3.0/a11yguard2-3.3.0.apk"
+  "versionCode": 12310,
+  "versionName": "3.3.1",
+  "notes": "无障碍守护 3.3.1（建议升级）\n\n· 修复关键 bug：小布被误排除导致语音完全失效\n· 重构去重：去掉会话基线状态机，改三层纯时间窗\n· 同词 6 秒冷却 + 跨词 1.2 秒间隔 + 取最长关键词\n· 性能：包名与关键词列表缓存（不再每事件全量扫描）\n· 覆盖 41 个助手（含豆包输入法、通义、星火）\n· 133 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.3.1/a11yguard2-3.3.1.apk"
 }
