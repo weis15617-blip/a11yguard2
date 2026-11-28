@@ -443,6 +443,121 @@ class TapAgentService : AccessibilityService() {
         }.getOrDefault(false)
     }
 
+    /**
+     * 自动点掉系统的「无障碍权限」确认弹窗。
+     *
+     * 弹窗样式：
+     *   检测到「无障碍守护」获取无障碍权限
+     *   [关闭无障碍]        ← 危险按钮
+     *   [保持开启]          ← 要点这个
+     *
+     * ── 为什么要公开这个方法 ──
+     *
+     * 原来只有 TapAgentProvider（点按路由）会确认弹窗。
+     * 但设备直写权限时走的是 ToggleRouter 直写路径，不经过 TapAgentProvider，
+     * 于是每次改设置都弹出这个框要手动点（累计到 4 次）。
+     *
+     * 无障碍服务本身有 dispatchGesture 能力，是唯一能可靠点掉它的地方
+     * （读屏会拦截 ACTION_CLICK，必须模拟真实触摸）。
+     */
+    fun dismissA11yConfirm() {
+        // 只点这些包名的窗口：系统 UI 或厂商安全中心
+        val sysPkgs = listOf(
+            "android", "com.android.systemui", "com.android.settings",
+            "com.oplus.safecenter", "com.oplus.security", "com.coloros.safecenter",
+            "com.miui.securitycenter", "com.huawei.systemmanager",
+            "com.vivo.permissionmanager", "com.samsung.android.lool"
+        )
+        // 弹窗按钮文案（很短，2~6 字）
+        val okTexts = listOf(
+            "保持开启", "保持启用", "保持打开", "保留", "继续",
+            "允许", "确定", "同意", "开启",
+            "Allow", "OK", "Keep on", "Enable", "Continue"
+        )
+        val dangerTexts = listOf("关闭无障碍", "停用", "禁用", "Turn off", "Disable")
+
+        repeat(10) {
+            val r = runCatching { rootInActiveWindow }.getOrNull()
+            if (r == null) {
+                android.os.SystemClock.sleep(250)
+                return@repeat
+            }
+
+            // ── 关键：必须是系统窗口 ──
+            //
+            // 不加这个校验时，rootInActiveWindow 常常是我们自己的 MainActivity，
+            // 界面上"无障碍守护 已开启"含"开启"二字就会被误点（实测踩过）。
+            val rPkg = r.packageName?.toString().orEmpty()
+            val isSystem = sysPkgs.any { rPkg == it || rPkg.startsWith(it + ".") }
+            if (!isSystem) {
+                // 不是系统弹窗，直接放弃，绝不乱点
+                return
+            }
+
+            val target = okTexts.firstNotNullOfOrNull { txt ->
+                bfsNode(r) { n ->
+                    val t = n.text?.toString().orEmpty().trim()
+                    // 精确匹配 + 文案要短（按钮不会是一整句话）
+                    t == txt && t.length <= 8
+                }
+            }
+
+            if (target != null && clickNodeSmart(target)) {
+                Diag.log("guard", "自动确认权限弹窗 ok=${target.text} pkg=$rPkg")
+                android.os.SystemClock.sleep(300)
+                return
+            }
+            android.os.SystemClock.sleep(250)
+        }
+        // 没找到弹窗是正常情况（大多数时候本来就不弹），不写日志
+    }
+
+    /** 广度优先找节点。 */
+    private fun bfsNode(
+        root: android.view.accessibility.AccessibilityNodeInfo,
+        predicate: (android.view.accessibility.AccessibilityNodeInfo) -> Boolean
+    ): android.view.accessibility.AccessibilityNodeInfo? {
+        val q = ArrayDeque<android.view.accessibility.AccessibilityNodeInfo>()
+        q.add(root)
+        var visited = 0
+        while (q.isNotEmpty() && visited < 300) {
+            val n = q.removeFirst()
+            visited++
+            if (predicate(n)) return n
+            for (i in 0 until runCatching { n.childCount }.getOrDefault(0)) {
+                runCatching { n.getChild(i) }.getOrNull()?.let { q.add(it) }
+            }
+        }
+        return null
+    }
+
+    /** 三级点击：CLICK → 父节点 → 模拟手势。 */
+    private fun clickNodeSmart(node: android.view.accessibility.AccessibilityNodeInfo): Boolean {
+        if (runCatching { node.performAction(
+                android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK
+            ) }.getOrDefault(false)
+        ) return true
+
+        var p = node.parent
+        var d = 0
+        while (p != null && d < 5) {
+            val pp = p
+            if (runCatching { pp.performAction(
+                    android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK
+                ) }.getOrDefault(false)
+            ) return true
+            p = pp.parent
+            d++
+        }
+
+        val rect = android.graphics.Rect()
+        runCatching { node.getBoundsInScreen(rect) }
+        if (rect.width() > 0 && rect.height() > 0) {
+            return tapByGesture(rect.centerX().toFloat(), rect.centerY().toFloat())
+        }
+        return false
+    }
+
     private fun resetGestureCounters() {
         upCount = 0
         upFirst = 0L

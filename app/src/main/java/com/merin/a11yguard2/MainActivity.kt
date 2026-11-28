@@ -2250,6 +2250,22 @@ class MainActivity : AppCompatActivity() {
         })
         bar.addView(pill("清空") { Diag.clear(); diagBody.text = "" })
         ll.addView(bar)
+
+        // ── 一键打包分享 ──
+        //
+        // 用 pill（和"刷新/复制/清空"同一套控件）而不是 clickRow：
+        // clickRow 返回的是 row() 布局，包在 cardWrap 里时点击事件
+        // 传递不可靠（实测点了没反应）。pill 已在这些按钮上验证可用。
+        val shareBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        shareBar.addView(pill("📦 打包分享诊断信息") { shareDiagBundle() })
+        ll.addView(shareBar)
+        ll.addView(hint(
+            "打包内容：诊断日志、设备信息、系统版本、无障碍服务状态、关键配置快照。" +
+                "分享前请留意日志中是否包含你不想公开的 App 名称。"
+        ))
         diagBody = TextView(this).apply {
             text = Diag.dump()
             textSize = 11f
@@ -2261,6 +2277,199 @@ class MainActivity : AppCompatActivity() {
         return ScrollView(this).apply { addView(ll) }
     }
 
+
+    /**
+     * 打包诊断信息并通过系统分享面板发出。
+     *
+     * 打包内容：
+     *   diag.log      原始诊断日志
+     *   device.txt    设备型号、系统版本、ABI、屏幕
+     *   settings.txt  关键配置快照
+     *   services.txt  无障碍服务启用/绑定/执行层状态
+     *   README.txt    说明这份报告包含什么
+     *
+     * 生成到 cacheDir，分享后系统会自动清理，不占长期空间。
+     */
+    private fun shareDiagBundle() {
+        android.util.Log.e("A11YDIAG", "shareDiagBundle 开始")
+        val zip = runCatching { buildDiagBundle() }
+        val zipFile = zip.getOrNull()
+        if (zipFile == null) {
+            val why = zip.exceptionOrNull()
+            android.util.Log.e("A11YDIAG", "打包失败", why)
+            Diag.log("app", "打包失败: ${why?.javaClass?.simpleName}: ${why?.message}")
+            toast("打包失败：${why?.message ?: "未知原因"}")
+            return
+        }
+        android.util.Log.e("A11YDIAG", "打包成功: ${zipFile.name} ${zipFile.length()} 字节")
+        Diag.log("app", "打包成功: ${zipFile.name} ${zipFile.length()} 字节")
+        runCatching {
+            val uri = ApkFileProvider.uriFor(this, zipFile)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "application/zip"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(
+                    Intent.EXTRA_SUBJECT,
+                    "无障碍守护诊断报告 ${BuildConfig.VERSION_NAME}"
+                )
+                putExtra(
+                    Intent.EXTRA_TEXT,
+                    "无障碍守护诊断报告\n" +
+                        "版本：${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）\n" +
+                        "包名：$packageName"
+                )
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "分享诊断报告"))
+        }.onFailure {
+            toast("没有可用的分享应用")
+        }
+    }
+
+    /** 收集信息并打成 ZIP。返回生成的文件。 */
+    private fun buildDiagBundle(): java.io.File? {
+        android.util.Log.e("A11YDIAG", "buildDiagBundle 开始")
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+            .format(java.util.Date())
+        val outDir = java.io.File(cacheDir, "diag").apply { mkdirs() }
+        // 清掉旧的报告，避免越积越多
+        runCatching {
+            outDir.listFiles()?.forEach { f ->
+                if (f.isFile && System.currentTimeMillis() - f.lastModified() > 3_600_000L) {
+                    f.delete()
+                }
+            }
+        }
+        val zip = java.io.File(outDir, "a11yguard2-diag-$stamp.zip")
+
+        val entries = LinkedHashMap<String, String>()
+
+        // 1) 诊断日志
+        entries["diag.log"] = runCatching { Diag.dump() }.getOrDefault("(日志为空)")
+
+        // 2) 设备信息
+        val sb = StringBuilder()
+        runCatching {
+            sb.appendLine("生成时间: $stamp")
+            sb.appendLine("应用版本: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+            sb.appendLine("包名: $packageName")
+            sb.appendLine()
+            sb.appendLine("厂商: ${Build.MANUFACTURER}")
+            sb.appendLine("品牌: ${Build.BRAND}")
+            sb.appendLine("型号: ${Build.MODEL}")
+            sb.appendLine("设备: ${Build.DEVICE}")
+            sb.appendLine("产品: ${Build.PRODUCT}")
+            sb.appendLine()
+            sb.appendLine("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+            sb.appendLine("安全补丁: ${Build.VERSION.SECURITY_PATCH}")
+            sb.appendLine("构建: ${Build.DISPLAY}")
+            sb.appendLine()
+            sb.appendLine("ABI: ${Build.SUPPORTED_ABIS.joinToString()}")
+            val dm = resources.displayMetrics
+            sb.appendLine("屏幕: ${dm.widthPixels}x${dm.heightPixels} @ ${dm.densityDpi}dpi")
+            sb.appendLine()
+            sb.appendLine("App uid: ${applicationInfo.uid}")
+            // 进程被杀的记录
+            sb.appendLine("当前时间: ${System.currentTimeMillis()}")
+            sb.appendLine("开机时长: ${android.os.SystemClock.elapsedRealtime() / 60000} 分钟")
+        }
+        entries["device.txt"] = sb.toString()
+
+        // 3) 配置快照
+        val cfg = StringBuilder()
+        runCatching {
+            cfg.appendLine("── 总开关 ──")
+            cfg.appendLine("守护启用: ${SvcRepo.isEnabled(this, GuardA11yService.COMP)}")
+            cfg.appendLine("点按代理启用: ${SvcRepo.isEnabled(this, TapAgentService.COMP)}")
+            cfg.appendLine()
+            cfg.appendLine("── 手势 ──")
+            cfg.appendLine("摇一摇开关: ${AppSettings.shakeOn(this)}")
+            cfg.appendLine("摇动次数: ${AppSettings.shakeCount(this)}")
+            cfg.appendLine("摇动灵敏度: ${AppSettings.shakeSensitivity(this)}")
+            cfg.appendLine("背面敲击开关: ${AppSettings.backTapOn(this)}")
+            cfg.appendLine("敲击次数: ${AppSettings.backTapCount(this)}")
+            cfg.appendLine("敲击灵敏度: ${AppSettings.backTapSensitivity(this)}")
+            cfg.appendLine()
+            cfg.appendLine("── 目标服务 ──")
+            cfg.appendLine("摇一摇目标: ${AppSettings.shakeTarget(this)}")
+            cfg.appendLine("敲击目标: ${AppSettings.backTapTarget(this)}")
+            cfg.appendLine()
+            cfg.appendLine("── 语音 ──")
+            cfg.appendLine("助手桥接开关: ${AppSettings.assistantBridgeOn(this)}")
+            cfg.appendLine("关键词条数: ${AppSettings.voiceKeywords(this).size}")
+            cfg.appendLine("监听助手数: ${runCatching { AssistantBridge.discoverAssistantPkgs(this).size }.getOrDefault(-1)}")
+            cfg.appendLine()
+            cfg.appendLine("── 统计 ──")
+            cfg.appendLine(AppSettings.statsLine(this))
+            cfg.appendLine()
+            cfg.appendLine("── 执行层 ──")
+            // 直写权限是决定执行层的关键事实，单独列出来
+            val secureOk = runCatching {
+                checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            }.getOrDefault(false)
+            cfg.appendLine("WRITE_SECURE_SETTINGS: " + if (secureOk) "已授权" else "未授权")
+            cfg.appendLine("守护服务绑定: " + (GuardA11yService.instance != null))
+            cfg.appendLine("点按服务绑定: " + (TapAgentService.instance != null))
+        }
+        entries["settings.txt"] = cfg.toString()
+
+        // 4) 无障碍服务状态
+        val svc = StringBuilder()
+        runCatching {
+            val enabled = SvcRepo.enabledComps(this)
+            svc.appendLine("已启用服务 (${enabled.size}):")
+            enabled.forEach { svc.appendLine("  $it") }
+            svc.appendLine()
+            svc.appendLine("全部已安装服务:")
+            SvcRepo.all(this).forEach { row ->
+                val on = SvcRepo.isEnabled(this, row.comp)
+                svc.appendLine("  [${if (on) "ON " else "off"}] ${row.comp}  @${row.label}")
+            }
+        }
+        entries["services.txt"] = svc.toString()
+
+        // 5) README
+        entries["README.txt"] = """
+无障碍守护 · 诊断报告
+生成时间：$stamp
+
+包含内容：
+  diag.log      诊断日志（运行状态、触发记录、错误）
+  device.txt    设备型号、系统版本、ABI、屏幕、开机时长
+  settings.txt  手势/语音/执行层的当前配置与统计
+  services.txt  无障碍服务的启用与绑定状态
+  README.txt    本文件
+
+如何提供反馈：
+  1. 加入 QQ 群 $FEEDBACK_QQ_GROUP
+  2. 把这个 ZIP 直接发到群里
+  3. 用一两句话说明现象（比如"说关闭解说没有反应"）
+
+注意：
+  日志里可能包含你手机上装过的 App 名称。
+  如果不希望公开某些信息，可以先解压删掉对应行再发。
+
+本报告由应用在本地生成，未上传到任何服务器。
+""".trimIndent()
+
+        // 写 ZIP
+        android.util.Log.e("A11YDIAG", "准备写 ZIP，${entries.size} 个条目 -> ${zip.absolutePath}")
+        val result = runCatching {
+            java.util.zip.ZipOutputStream(zip.outputStream().buffered()).use { zos ->
+                entries.forEach { (name, content) ->
+                    zos.putNextEntry(java.util.zip.ZipEntry(name))
+                    zos.write(content.toByteArray(Charsets.UTF_8))
+                    zos.closeEntry()
+                }
+            }
+            zip
+        }
+        result.exceptionOrNull()?.let {
+            android.util.Log.e("A11YDIAG", "写 ZIP 失败: ${it.message}", it)
+        }
+        return result.getOrNull()
+    }
 
     // ---------- 关于 ----------
 

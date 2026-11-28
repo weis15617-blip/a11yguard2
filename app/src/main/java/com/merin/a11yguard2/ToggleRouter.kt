@@ -65,6 +65,13 @@ object ToggleRouter {
             mode(ctx), shizukuStatus(ctx), tapAvailable(), secureAvailable(ctx), rootCache
         )
 
+    /**
+     * 执行切换，并在之后自动确认系统权限弹窗。
+     *
+     * 直写/Shizuku/root 三条路由都会让系统弹出「检测到无障碍权限」确认框，
+     * 而那个框只有无障碍服务能自动点掉（读屏会拦截 ACTION_CLICK）。
+     * 所以这里统一在后台线程等一会儿再确认，不影响主流程耗时。
+     */
     fun toggle(ctx: Context, comp: String, want: Boolean): ToggleResult {
         // 加锁 = 硬拒绝关闭：任何入口（UI / 自检 / 复活）都不能走到写 secure settings 这一步
         if (LockLogic.denyClose(comp, want, AppSettings.lockedComps(ctx))) {
@@ -90,9 +97,32 @@ object ToggleRouter {
         for (route in order) {
             val res = providerFor(route).toggle(ctx, comp, want)
             Diag.log("route", "try ${res.logLine()}")
-            if (res.ok) return res
+            if (res.ok) {
+                confirmAfterToggle(ctx, want)
+                return res
+            }
             last = res
         }
         return last ?: ToggleResult("none", comp, false, false, false, "无可用执行方式")
+    }
+
+    /**
+     * 切换成功后，自动点掉系统弹出的无障碍权限确认框。
+     *
+     * 这个弹窗在直写/Shizuku/root 三条路由上都会出现（系统认为
+     * 有应用在改无障碍设置）。只有无障碍服务能可靠点掉它 ——
+     * 读屏会拦截 ACTION_CLICK，必须用 dispatchGesture 注入真实触摸。
+     *
+     * 放到后台线程：确认要轮询最多 2.5 秒，不能拖慢调用方。
+     */
+    private fun confirmAfterToggle(ctx: Context, want: Boolean) {
+        // 关闭时系统不弹（只在自己被开启/被接管时弹）
+        if (!want) return
+        Thread {
+            // 等系统把弹窗显示出来
+            android.os.SystemClock.sleep(600)
+            runCatching { TapAgentService.instance?.dismissA11yConfirm() }
+                .onFailure { Diag.log("guard", "auto-confirm 失败: ${it.message}") }
+        }.start()
     }
 }

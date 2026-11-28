@@ -43,25 +43,57 @@ class ApkFileProvider : ContentProvider() {
 
     override fun onCreate(): Boolean = true
 
-    override fun getType(uri: Uri): String = "application/vnd.android.package-archive"
+    override fun getType(uri: Uri): String {
+        val n = uri.lastPathSegment.orEmpty()
+        return when {
+            n.endsWith(".zip", ignoreCase = true) -> "application/zip"
+            else -> "application/vnd.android.package-archive"
+        }
+    }
 
     /** 把 URI 解析成受限制的文件路径；任何不合规都返回 null。 */
+    /** 允许分享的扩展名。 */
+    private val ALLOWED_EXT = listOf(".apk", ".zip")
+
+    /**
+     * 把 URI 解析成受限制的文件路径；任何不合规都返回 null。
+     *
+     * 支持两类文件：
+     *   · 更新包 APK（filesDir/updates 或 getExternalFilesDir）
+     *   · 诊断报告 ZIP（cacheDir/diag）
+     *
+     * 安全约束（不要放宽）：
+     *   1. 只允许 .apk / .zip
+     *   2. 禁止路径穿越与目录分隔符
+     *   3. 规范化后必须仍在基准目录之下
+     *   4. 只读
+     */
     private fun resolve(uri: Uri): File? {
         val ctx = context ?: return null
         val name = uri.lastPathSegment ?: return null
-        // 1) 只允许 .apk
-        if (!name.endsWith(".apk", ignoreCase = true)) return null
+
+        // 1) 扩展名白名单
+        if (ALLOWED_EXT.none { name.endsWith(it, ignoreCase = true) }) return null
+
         // 2) 禁止路径穿越与目录分隔
         if (name.contains('/') || name.contains('\\') || name.contains("..")) return null
 
-        val base = ctx.getExternalFilesDir(null) ?: return null
-        val f = File(base, name)
-        // 3) 规范化后必须仍在 base 之下
-        val canonicalBase = base.canonicalFile
-        val canonicalFile = f.canonicalFile
-        if (!canonicalFile.path.startsWith(canonicalBase.path + File.separator)) return null
-        if (!canonicalFile.isFile) return null
-        return canonicalFile
+        // 3) 依次在候选基准目录里找
+        val bases = buildList {
+            runCatching { ctx.getExternalFilesDir(null) }.getOrNull()?.let { add(it) }
+            add(ctx.filesDir)
+            add(java.io.File(ctx.cacheDir, "diag"))
+        }
+
+        for (base in bases) {
+            val f = File(base, name)
+            val canonicalBase = runCatching { base.canonicalFile }.getOrNull() ?: continue
+            val canonicalFile = runCatching { f.canonicalFile }.getOrNull() ?: continue
+            // 4) 必须仍在 base 之下
+            if (!canonicalFile.path.startsWith(canonicalBase.path + File.separator)) continue
+            if (canonicalFile.isFile) return canonicalFile
+        }
+        return null
     }
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
