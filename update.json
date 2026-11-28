@@ -1,6 +1,6 @@
 {
-  "versionCode": 12310,
-  "versionName": "3.3.1",
-  "notes": "无障碍守护 3.3.1（建议升级）\n\n· 修复关键 bug：小布被误排除导致语音完全失效\n· 重构去重：去掉会话基线状态机，改三层纯时间窗\n· 同词 6 秒冷却 + 跨词 1.2 秒间隔 + 取最长关键词\n· 性能：包名与关键词列表缓存（不再每事件全量扫描）\n· 覆盖 41 个助手（含豆包输入法、通义、星火）\n· 133 个单元测试全绿",
-  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.3.1/a11yguard2-3.3.1.apk"
+  "versionCode": 12320,
+  "versionName": "3.3.2",
+  "notes": "无障碍守护 3.3.2\n\n· 新增：诊断页一键打包分享（日志+设备+配置+服务状态）\n· 修复：权限弹窗自动确认从未生效（挂在点按路由上，直写路径不经过）\n· 修复：自动确认会误点自己界面导致关闭服务（加系统窗口白名单）\n· 133 个单元测试全绿",
+  "url": "https://github.com/weis15617-blip/a11yguard2/releases/download/v3.3.2/a11yguard2-3.3.2.apk"
 }
