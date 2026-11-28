@@ -3,14 +3,14 @@ package com.merin.a11yguard2
 import android.view.accessibility.AccessibilityEvent
 
 /**
- * 从第三方语音助手的界面上读文字，匹配关键词后执行动作。
+ * 从第三方语音助手界面上读文字，匹配关键词后执行动作。
  *
  * ══════════════════════════════════════════════════════════════════
- * 为什么这样做
+ * 为什么这样做（技术边界）
  * ══════════════════════════════════════════════════════════════════
  *
  * Android **没有 API** 能把其他 App 的语音识别结果交给第三方 ——
- * 那是安全边界，任何应用（含 root）都无法绕过。
+ * 那是安全边界，任何应用都无法绕过。
  *
  * 但语音助手有个绕不开的特征：**它必须把识别结果显示给用户看**。
  * 本应用是无障碍服务，能读取界面上出现的文字。于是：
@@ -20,87 +20,88 @@ import android.view.accessibility.AccessibilityEvent
  *       → 本服务读到 → 匹配关键词 → 执行切换
  *
  * ══════════════════════════════════════════════════════════════════
- * 关键约束
+ * 去重设计（这是稳定性的核心）
  * ══════════════════════════════════════════════════════════════════
  *
- * **必须限制包名**。无障碍事件能拿到全系统的文字，不限包名的话：
- *   · 任何 App 里出现「关闭解说」四个字都会触发
- *   · 耗电显著增加（每次界面变化都要扫文字）
+ * 早期版本用过三种方案，都有问题：
  *
- * 所以只监听配置里列出的助手包名，默认覆盖国内常见助手。
+ *   ① 「文字相同才去重」—— 助手界面每帧文字都变，去重完全失效，
+ *      同一句话执行 6 次切换，最终状态回到原样（用户以为没反应）。
+ *
+ *   ② 「会话基线」（首帧只记录不执行）—— 多服务同时产生事件时
+ *      界面归属抖动（小布悬浮窗 + 解说读屏），基线被反复重建，
+ *      用户那一次的话就被当成"已见"吃掉。
+ *
+ *   ③ 「排除装有无障碍服务的包」—— 小布自己就装了 AnalogSkillService，
+ *      被误删导致语音完全失效（零事件）。
+ *
+ * **现在改为纯时间窗去重，无任何会话状态**：
+ *
+ *   · 同一关键词 6 秒内只执行一次
+ *   · 不同关键词之间至少间隔 1.2 秒
+ *   · 多个关键词同时出现时取最长的
+ *
+ * 这样不管界面怎么抖动、几个服务同时产生事件，结果都稳定：
+ * 用户说一句 → 恰好执行一次。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 性能
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * 包名列表和关键词表都带缓存。实测不做缓存时，助手界面每秒几十个事件，
+ * 每个事件要做 3 次 PackageManager 查询 + 解析 192 行关键词字符串
+ * （约 400 次字符串操作），界面明显卡顿。
  */
 object AssistantBridge {
-
-    /**
-     * 触发后的冷却时间（毫秒）。
-     *
-     * 实测：小布界面从"开始解析"到"指令解析结束"会刷新 6 次，
-     * 每次文字都不同。若只按"文字相同"去重，同一句话会执行 6 次切换，
-     * 最终状态回到原样 —— 用户以为没反应。
-     *
-     * 4 秒足够覆盖整个界面刷新周期，又不会影响下一句话。
-     */
-    private const val COOLDOWN_MS = 800L
 
     /** 只处理不超过这个长度的文本（助手的识别结果通常很短）。 */
     private const val MAX_TEXT_LEN = 120
 
-    /** 上次执行时刻（毫秒）。冷却期内完全不响应。 */
-    private var lastFireAt = 0L
+    // ══════════ 去重参数 ══════════
 
-    /** 上次执行的关键词，用于日志对照与去重。 */
+    /** 同一关键词的最小执行间隔。界面刷新会持续 2~4 秒，6 秒足够。 */
+    private const val SAME_KEYWORD_COOLDOWN_MS = 6000L
+
+    /** 不同关键词之间的最小间隔。用户连说两句通常间隔 1 秒以上。 */
+    private const val CROSS_KEYWORD_GAP_MS = 1200L
+
+    /** 关键词记忆有效期，超过就清理，避免 Map 无限增长。 */
+    private const val KEYWORD_MEMORY_MS = 60_000L
+
+    // ══════════ 去重状态（纯时间戳，无会话机）══════════
+
+    /** 每个关键词上次执行的时刻（毫秒）。 */
+    private val keywordLastAt = HashMap<String, Long>()
+
+    /** 上次任意执行的时刻。 */
+    private var lastAnyFireAt = 0L
+
+    /** 上次执行的关键词（诊断用）。 */
     private var lastKeyword = ""
 
-    /** 上次执行同一关键词的时刻（毫秒），用于"同词只执行一次"。 */
-    private var lastSameKeywordAt = 0L
+    // ══════════ 缓存 ══════════
 
-    /** 同一关键词的最小执行间隔。界面刷新会多次派发同一事件。 */
-    private const val SAME_KEYWORD_GAP_MS = 1500L
+    /** 包名列表缓存：避免每个事件都做 PackageManager 查询。 */
+    @Volatile
+    private var cachedPkgs: List<String>? = null
 
-    /** 上次处理的原始文本（诊断用）。 */
-    private var lastText = ""
+    @Volatile
+    private var cachedPkgSig: String? = null
 
-    /**
-     * 上一帧文本里出现过的关键词集合。
-     *
-     * 判据核心：只有当关键词**从无到有**时才响应。
-     * 助手界面会把同一句话显示很多帧（"开始解析"→"解析结束"→"暂不支持"），
-     * 那些帧里关键词一直都在，不该重复触发。
-     */
-    private var seenKeywords: Set<String> = emptySet()
+    /** 由服务注入，用于读配置。 */
+    @Volatile
+    var appContext: android.content.Context? = null
 
-    /** 当前正在观察的助手包名，换了就重建基线。 */
-    private var currentPkg = ""
+    // ══════════ 助手包名 ══════════
 
-    /** 上一次收到事件的时间，间隙过长说明界面已关，需重建基线。 */
-    private var lastEventAt = 0L
-
-    /** 是否已经为当前会话建立过基线。 */
-    private var baselineReady = false
-
-    /** 事件间隙超过这个值，认为助手界面已关闭，下次重新建基线。 */
-    private const val SESSION_GAP_MS = 10_000L
-
-    /**
-     * 默认监听的助手包名。
-     *
-     * 覆盖国内主流 + Google：
-     *   com.heytap.speechassist   OPPO 小布
-     *   com.oplus.ovoicemanager   OPPO 语音引擎
-     *   com.miui.voiceassist      小米小爱
-     *   com.vivo.abe              vivo 语音助手
-     *   com.google.android.googlequicksearchbox  Google 助手
-     *   com.huawei.vassistant     华为小艺
-     */
     /**
      * 已知助手包名（静态兜底）。
      *
-     * 覆盖国内主流厂商 + Google。这些只是**兜底**：
-     * 真正生效的列表由 [discoverAssistantPkgs] 动态扫描本机得出，
-     * 静态表用来补上那些不声明 ACTION_ASSIST / ACTION_VOICE_COMMAND 的助手。
+     * 真正生效的列表由 [discoverAssistantPkgs] 动态扫描得出，
+     * 静态表用来补上那些不声明 ACTION_ASSIST 的助手。
      */
     val KNOWN_ASSISTANT_PKGS: List<String> = listOf(
-        // ── OPPO / 一加 / realme（ColorOS）──
+        // OPPO / 一加 / realme
         "com.heytap.speechassist",
         "com.oplus.ovoicemanager",
         "com.oplus.ovoicemanager.wakeup",
@@ -108,49 +109,45 @@ object AssistantBridge {
         "com.coloros.assistantscreen",
         "com.coloros.floatassistant",
         "com.oplus.voice.crs",
-
-        // ── 小米 / 红米（MIUI / HyperOS）──
+        // 小米 / 红米
         "com.miui.voiceassist",
         "com.xiaomi.voiceassistant",
         "com.miui.voiceassistant",
         "com.xiaomi.aiasst.service",
         "com.xiaomi.aiasst.vision",
-
-        // ── vivo / iQOO（OriginOS）──
+        // vivo / iQOO
         "com.vivo.abe",
         "com.vivo.ai",
         "com.vivo.voiceassist",
         "com.bbk.voiceassist",
-
-        // ── 华为（HarmonyOS / EMUI）──
+        // 华为
         "com.huawei.vassistant",
         "com.huawei.aiassistant",
         "com.huawei.ohos.celia",
-
-        // ── 荣耀（MagicOS）──
+        // 荣耀
         "com.hihonor.vassistant",
         "com.hihonor.aiassistant",
-
-        // ── 三星（One UI）──
+        // 三星
         "com.samsung.android.bixby.agent",
         "com.samsung.android.bixby.wakeup",
         "com.samsung.android.app.sbrowser.bixby",
-
-        // ── 魅族（Flyme）──
+        // 魅族
         "com.meizu.voiceassist",
         "com.meizu.flyme.voiceassist",
-
-        // ── 联想 / 其他 ──
+        // 联想
         "com.lenovo.voiceassist",
         "com.zui.voiceassist",
-
-        // ── 通用 / 第三方 ──
+        // 输入法（语音输入文字会停在输入框，最容易读）
         "com.iflytek.inputmethod",
         "com.baidu.input",
+        "com.baidu.input_oppo",
         "com.sohu.inputmethod.sogou",
         "com.tencent.qqpinyin",
-
-        // ── Google ──
+        "com.bytedance.android.doubaoime",
+        // 第三方 AI
+        "com.aliyun.tongyi",
+        "com.hewuqi.xinghuo",
+        // Google
         "com.google.android.googlequicksearchbox",
         "com.google.android.apps.search.assistant",
         "com.google.android.voicesearch"
@@ -164,8 +161,9 @@ object AssistantBridge {
      *   2. 响应 ACTION_VOICE_COMMAND 的应用
      *   3. 系统当前设置的默认助手
      *
-     * 这样不管厂商包名怎么变、机型怎么不同，只要它被系统认作助手就能扫到。
-     * 静态表作为补充（有些助手不声明这两个 Intent）。
+     * **注意：只排除自己，不排除"装有无障碍服务的包"。**
+     * 曾经在这里 `removeAll(managedPkgs)`，结果小布（自己装了
+     * AnalogSkillService）被一起删掉，语音完全失效（实测零事件）。
      */
     fun discoverAssistantPkgs(ctx: android.content.Context): List<String> {
         val found = LinkedHashSet<String>()
@@ -181,7 +179,6 @@ object AssistantBridge {
                 android.content.Intent(android.content.Intent.ACTION_VOICE_COMMAND), 0
             ).forEach { ri -> ri.activityInfo?.packageName?.let { found.add(it) } }
         }
-        // 系统默认助手的包名
         runCatching {
             val def = android.provider.Settings.Secure.getString(
                 ctx.contentResolver, "assistant"
@@ -191,17 +188,37 @@ object AssistantBridge {
             }
         }
 
-        // 已知但扫描不到的，也加进来（不影响，只是多几条监听）
         found.addAll(KNOWN_ASSISTANT_PKGS)
+
+        // 只排除自己
+        found.remove(ctx.packageName)
 
         return found.toList()
     }
 
+    /** 取监听包名列表（带缓存）。 */
+    private fun pkgListCached(ctx: android.content.Context): List<String> {
+        val sig = AppSettings.assistantPkgsRaw(ctx)
+        val c = cachedPkgs
+        if (c != null && cachedPkgSig == sig) return c
+        val fresh = runCatching { discoverAssistantPkgs(ctx) }
+            .getOrDefault(KNOWN_ASSISTANT_PKGS)
+        cachedPkgs = fresh
+        cachedPkgSig = sig
+        Diag.log("assist", "监听助手 ${fresh.size} 个（已缓存）")
+        return fresh
+    }
+
+    /** 用户改配置后清缓存。 */
+    fun invalidatePkgCache() {
+        cachedPkgs = null
+        cachedPkgSig = null
+    }
+
+    // ══════════ 事件入口 ══════════
+
     /**
-     * 处理一个无障碍事件。由 TapAgentService / GuardA11yService 调用。
-     *
-     * @param enabled    功能总开关（用户可在设置页关掉）
-     * @param pkgList    要监听的包名（用户可改）
+     * 处理一个无障碍事件。由 TapAgentService 调用。
      */
     fun onEvent(
         event: AccessibilityEvent,
@@ -211,45 +228,31 @@ object AssistantBridge {
         onAction: (String, String) -> Unit
     ) {
         if (!enabled) return
-        if (pkgList.isEmpty()) return
+
+        val ctx0 = appContext
+        val effectivePkgs = if (ctx0 != null) pkgListCached(ctx0) else pkgList
+        if (effectivePkgs.isEmpty()) return
 
         val pkg = event.packageName?.toString().orEmpty()
         if (pkg.isEmpty()) return
 
-        // 排除自己：本应用也是无障碍服务，界面会被自己的事件扫到，
-        // 导致在 App 内操作时误触发关键词。
+        // 排除自己：本应用也是无障碍服务，界面会被自己的事件扫到
         val self = appContext?.packageName.orEmpty()
         if (self.isNotEmpty() && (pkg == self || pkg.startsWith(self + "."))) return
 
-        if (pkgList.none { pkg == it || pkg.startsWith(it + ".") }) return
+        // 只处理监听列表里的包
+        if (effectivePkgs.none { pkg == it || pkg.startsWith(it + ".") }) return
 
-        // ── 会话边界检测 ──
+        // ── 合并文本，只处理一次 ──
         //
-        // 助手界面刚打开时，屏幕上可能还残留着上次的识别结果。
-        // 若直接判定"新出现"，会立刻误触发。
-        // 所以首次见到某助手界面时只建立基线，不执行动作。
-        val nowMs = System.currentTimeMillis()
-        val pkgChanged = pkg != currentPkg
-        val longGap = lastEventAt > 0 && nowMs - lastEventAt > SESSION_GAP_MS
-        if (pkgChanged || longGap) {
-            currentPkg = pkg
-            baselineReady = false
-            seenKeywords = emptySet()
-            Diag.log("assist", "新会话（$pkg），重建基线")
-        }
-        lastEventAt = nowMs
-
-        // ── 合并文本 ──
-        //
-        // 必须合并后**只处理一次**。分成两次调用的话，第一次可能建立了基线，
-        // 第二次立刻按"新出现"判定命中 —— 实测会误触发一次。
+        // 分成两次调用（先事件文字、再窗口文字）会让同一帧被判定两次，
+        // 早期踩过：基线刚建立就被第二次调用命中。
         val sb = StringBuilder()
         event.text?.forEach { cs -> if (cs != null) sb.append(cs).append(' ') }
         event.contentDescription?.toString()?.let { sb.append(it) }
         var merged = sb.toString().trim()
 
         if (merged.isEmpty()) {
-            // 事件没带文字：读整个活动窗口
             val win = runCatching { windowText() }.getOrNull().orEmpty()
             if (win.isNotEmpty()) merged = win
         }
@@ -260,9 +263,16 @@ object AssistantBridge {
         fire(merged, onAction)
     }
 
+    // ══════════ 匹配与执行 ══════════
 
-
-    /** 匹配并执行；命中返回 true。 */
+    /**
+     * 匹配并执行。命中返回 true。
+     *
+     * 三层时间窗去重，无会话状态：
+     *   ① 同一关键词 6 秒内只执行一次
+     *   ② 不同关键词之间至少 1.2 秒
+     *   ③ 多个关键词同时出现时取最长的
+     */
     private fun fire(
         raw: String,
         onAction: (String, String) -> Unit
@@ -271,86 +281,64 @@ object AssistantBridge {
 
         val now = System.currentTimeMillis()
 
-        // 当前帧里出现了哪些关键词
+        // 定期清理过期记录
+        if (keywordLastAt.size > 64) {
+            keywordLastAt.entries.removeAll { now - it.value > KEYWORD_MEMORY_MS }
+        }
+
         val present = matchAll(raw)
+        if (present.isEmpty()) return false
 
-        // ══ 核心判据：新出现 ══
-        //
-        // 助手界面会把同一句话显示很多帧，每帧文字都不同
-        // （"开始解析" → "指令解析结束" → "该应用暂不支持"）。
-        // 若按"文字相同"去重，同一句话会执行好几次，最终状态回到原样。
-        //
-        // 改成判断关键词是否"从无到有"：
-        //   present - seenKeywords 非空 → 这一帧新出现了关键词 → 响应
-        //   present ⊆ seenKeywords     → 都是旧文字 → 忽略
-        // 基线未建立：只记录，不执行
-        if (!baselineReady) {
-            seenKeywords = present
-            baselineReady = true
-            if (present.isNotEmpty()) {
-                Diag.log("assist", "基线建立，已见关键词：${present.joinToString()}")
-            }
-            return false
-        }
-
-        val fresh = present - seenKeywords
-        seenKeywords = present
-
-        if (fresh.isEmpty()) return false
-
-        // 短冷却兜底：防止界面清空重建导致"消失又出现"被算两次
-        if (now - lastFireAt < COOLDOWN_MS) {
-            Diag.log("assist", "冷却中，忽略新出现的「${fresh.first()}」")
-            return false
-        }
-
-        // 取最长的那个（避免「解说」抢在「开启解说」之前）
-        val keyword = fresh.maxByOrNull { it.length } ?: return false
-
-        // 同一关键词短时间内只执行一次。
-        //
-        // 即使只有一个无障碍服务处理事件，界面刷新仍可能把同一句话
-        // 派发多次（每次文字略有不同），导致 execute 两遍 →
-        // 开关切两次回到原位，用户体感是"没反应"。
-        if (keyword == lastKeyword && now - lastSameKeywordAt < SAME_KEYWORD_GAP_MS) {
-            Diag.log("assist", "同词冷却，忽略重复的「$keyword」")
-            return false
-        }
-
+        // 取最长（避免「解说」抢在「开启解说」之前）
+        val keyword = present.maxByOrNull { it.length } ?: return false
         val action = matchAction(raw, keyword) ?: return false
 
-        lastFireAt = now
+        // ① 同词冷却
+        val lastSame = keywordLastAt[keyword] ?: 0L
+        if (lastSame > 0 && now - lastSame < SAME_KEYWORD_COOLDOWN_MS) {
+            val left = (SAME_KEYWORD_COOLDOWN_MS - (now - lastSame)) / 1000
+            Diag.log("assist", "同词冷却 ${left}s：$keyword")
+            return false
+        }
+
+        // ② 跨词间隔
+        if (lastAnyFireAt > 0 && now - lastAnyFireAt < CROSS_KEYWORD_GAP_MS) {
+            Diag.log("assist", "间隔 ${now - lastAnyFireAt}ms 过短，忽略：$keyword")
+            return false
+        }
+
+        keywordLastAt[keyword] = now
+        lastAnyFireAt = now
         lastKeyword = keyword
-        lastSameKeywordAt = now
-        lastText = raw
         Diag.log("assist", "命中「$keyword」→ $action")
         onAction(keyword, action)
         return true
     }
 
-    /** 当前文本里出现的所有关键词。 */
+    /** 当前文本里出现的所有关键词（用缓存，避免每次重解析）。 */
     private fun matchAll(raw: String): Set<String> {
         val ctx = appContext ?: return emptySet()
         val text = raw.replace(" ", "").lowercase()
-        return AppSettings.voiceKeywords(ctx)
-            .map { it.first }
-            .filter { it.isNotEmpty() && text.contains(it.replace(" ", "").lowercase()) }
+        return AppSettings.voiceKeywordsNormalized(ctx)
+            .filter { it.first.isNotEmpty() && text.contains(it.first) }
+            .map { it.second }
             .toSet()
     }
 
     /** 查某个关键词对应的动作。 */
     private fun matchAction(raw: String, keyword: String): String? {
         val ctx = appContext ?: return null
-        return AppSettings.voiceKeywords(ctx)
-            .firstOrNull { it.first == keyword }
-            ?.second
+        return AppSettings.voiceKeywordsNormalized(ctx)
+            .firstOrNull { it.second == keyword }
+            ?.third
     }
+
+    // ══════════ 工具 ══════════
 
     /**
      * 遍历一棵无障碍节点树，收集所有文字。
      *
-     * 深度限制 8 层：助手界面不会更深，也防止某些异常树导致递归爆栈。
-     * 总长度限制 2000 字：只要够匹配关键词即可，不必把整屏内容都拼出来。
+     * 深度限制 8 层，总长度限制 2000 字。
      */
     fun collectText(
         node: android.view.accessibility.AccessibilityNodeInfo?,
@@ -371,34 +359,10 @@ object AssistantBridge {
         return sb.toString().trim()
     }
 
-    /** 在关键词表里找最长的命中项。 */
-    private fun matchKeyword(raw: String): Pair<String, String>? {
-        val ctx = appContext ?: return null
-        val text = raw.replace(" ", "").lowercase()
-        return AppSettings.voiceKeywords(ctx)
-            .filter { it.first.isNotEmpty() && text.contains(it.first.replace(" ", "").lowercase()) }
-            .maxByOrNull { it.first.length }
-    }
-
-    /**
-     * 清空"已见关键词"记录。
-     *
-     * 何时调用：
-     *   · 用户切换助手 / 关闭再打开功能
-     *   · 助手界面彻底关闭时（下次打开重新算"新出现"）
-     */
+    /** 清空去重状态（切换助手或关闭功能时调用）。 */
     fun resetSeen() {
-        seenKeywords = emptySet()
-        lastFireAt = 0L
+        keywordLastAt.clear()
+        lastAnyFireAt = 0L
         lastKeyword = ""
-        lastText = ""
-        currentPkg = ""
-        lastEventAt = 0L
-        baselineReady = false
-        lastSameKeywordAt = 0L
     }
-
-        /** 由服务在 onCreate 时注入，用于读配置。 */
-    @Volatile
-    var appContext: android.content.Context? = null
 }

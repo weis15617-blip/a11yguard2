@@ -252,6 +252,47 @@ object AppSettings {
         p(ctx).edit().putString("voice_keywords", raw).apply()
     }
 
+    /**
+     * 解析后的关键词缓存。
+     *
+     * 为什么必须缓存：192 条关键词，每次解析要做 192 次 trim/split，
+     * 匹配时还要对每条做 replace+lowercase（约 400 次字符串操作）。
+     * 而 onAccessibilityEvent 每秒被调几十次 —— 这是"语音不流畅"的原因之一。
+     *
+     * 缓存的是「(归一化关键词, 原始关键词, 动作)」三元组，
+     * 归一化好的字符串直接用于 contains 判断。
+     */
+    @Volatile
+    private var kwCache: List<Triple<String, String, String>>? = null
+
+    @Volatile
+    private var kwCacheSig: String? = null
+
+    /** 取归一化好的关键词表（带缓存）。 */
+    fun voiceKeywordsNormalized(ctx: Context): List<Triple<String, String, String>> {
+        val raw = voiceKeywordsRaw(ctx)
+        val c = kwCache
+        if (c != null && kwCacheSig == raw) return c
+
+        val fresh = raw.lines().mapNotNull { line ->
+            val s = line.trim()
+            if (s.isEmpty() || !s.contains('|')) return@mapNotNull null
+            val k = s.substringBefore('|').trim()
+            val v = s.substringAfter('|').trim()
+            if (k.isEmpty() || v.isEmpty()) null
+            else Triple(k.replace(" ", "").lowercase(), k, v)
+        }
+        kwCache = fresh
+        kwCacheSig = raw
+        return fresh
+    }
+
+    /** 用户改关键词后清缓存。 */
+    fun invalidateKeywordCache() {
+        kwCache = null
+        kwCacheSig = null
+    }
+
     /** 解析成 (关键词, 动作) 列表。格式错误的行会被忽略。 */
     fun voiceKeywords(ctx: Context): List<Pair<String, String>> =
         voiceKeywordsRaw(ctx)

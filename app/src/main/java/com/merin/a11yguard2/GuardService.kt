@@ -37,9 +37,31 @@ class GuardService : Service() {
         Diag.init(this)
         createChannel()
         // 统计启动次数；如果是「上次没走 onDestroy 就没了」则额外算一次重启
-        runCatching {
-            AppSettings.bumpStart(this)
+        runCatching<Unit> {
             val sp = SvcRepo.prefs(this)
+
+            // 覆盖安装后清零统计。
+            //
+            // 为什么要清：「启动 82」里的绝大部分是 adb install 造成的 ——
+            // 每次覆盖安装都会重启进程、+1 启动。用户看到的数字应该是
+            // 「这个版本启动了几次」，而不是"这个应用历史上装了多少版"。
+            val installTime = runCatching {
+                packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+            }.getOrDefault(0L)
+            val seenInstall = sp.getLong("stat_install_time", 0L)
+            if (installTime > 0 && installTime != seenInstall) {
+                sp.edit()
+                    .putLong("stat_install_time", installTime)
+                    .putInt("stat_ok", 0)
+                    .putInt("stat_fail", 0)
+                    .putInt("stat_start", 0)
+                    .putInt("stat_restart", 0)
+                    .putInt("stat_revive", 0)
+                    .apply()
+                Diag.log("fgs", "检测到 APK 更新，统计已重置")
+            }
+
+            AppSettings.bumpStart(this)
             val wasClean = sp.getBoolean("clean_exit", false)
             // 开机自启、覆盖安装都会重启进程，但那不是「异常退出」。
             // 只有在同一次开机周期内、上次又没走 onDestroy，才说明是被系统杀掉的。
@@ -51,10 +73,7 @@ class GuardService : Service() {
             // 说明上次是被安装打断的，不计入重启。
             val nowWall = System.currentTimeMillis()
             val lastRunWall = sp.getLong("last_run_wall", 0L)
-            val lastInstall = runCatching {
-                packageManager.getPackageInfo(packageName, 0).lastUpdateTime
-            }.getOrDefault(0L)
-            val killedByInstall = lastInstall > 0 && lastRunWall > 0 && lastRunWall < lastInstall
+            val killedByInstall = installTime > 0 && lastRunWall > 0 && lastRunWall < installTime
             if (!wasClean && sameBoot && !killedByInstall && sp.getInt("stat_start", 1) > 1) {
                 AppSettings.bumpRestart(this)
                 Diag.log("fgs", "检测到被系统杀死后重启（同一开机周期），重启数 +1")
@@ -348,8 +367,14 @@ class GuardService : Service() {
         // 巡检时 instance 还没赋值，误判为"没绑定"就去修，修完服务自己也连上了，
         // 于是每次都记一次失败。开机时这种假失败能刷十几条。
         if (SvcRepo.isEnabled(this, comp) && isBound(comp)) {
+            // 已启用且已绑定：什么都不用做，**不计数**。
+            //
+            // 早期这里 bumpStat(true)，导致"成功"变成"巡检次数" ——
+            // 每 5 秒巡检一次、3 个服务，一小时就是 2000+。
+            // 用户看到的「成功 361」其实只是巡检了 361 轮，服务压根没出过问题。
+            //
+            // 统计的意义是"我帮你修好了几次"，不是"我看了几眼"。
             Diag.log("keep", "skip already-bound target=${SvcRepo.normalize(comp)}")
-            AppSettings.bumpStat(this, true)
             return true
         }
         // 开机早期常见：系统刚起来，Shizuku 还没拉起、无障碍通道尚未就绪，
@@ -375,11 +400,21 @@ class GuardService : Service() {
         }
         lastTryAt[comp] = now
         Diag.log("fgs", "修复 $comp")
+
+        // 修复前先记下"是否本来就不可用"。
+        //
+        // 拉活（revive）的语义应该是"服务被系统杀掉/关掉，我把它救回来了"。
+        // 但早期实现里，只要 toggle 成功就 +1 拉活，结果：
+        //   · 开机后系统还没就绪 → 修一次 → 算一次拉活
+        //   · 覆盖安装 APK → 系统重绑 → 修一次 → 又算一次
+        // 这些都不是"被杀死后救回"，实测累积到 68 次，用户完全看不懂。
+        val wasUnavailable = !SvcRepo.isEnabled(this, comp) || !isBound(comp)
+
         val res = ToggleRouter.toggle(this, comp, true)
         AppSettings.bumpStat(this, res.ok)
-        // 只有真的执行了补回并且成功，才算一次「拉活」
         if (res.ok) {
-            AppSettings.bumpRevive(this)
+            // 只有"真的不可用 → 修好后可用"才算拉活
+            if (wasUnavailable) AppSettings.bumpRevive(this)
             consecutiveFails.remove(comp)
         } else {
             consecutiveFails[comp] = (consecutiveFails[comp] ?: 0) + 1

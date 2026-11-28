@@ -2513,10 +2513,12 @@ class MainActivity : AppCompatActivity() {
             .setView(box)
             .setPositiveButton("保存") { _, _ ->
                 AppSettings.setAssistantPkgsRaw(this, box.text.toString())
+                AssistantBridge.invalidatePkgCache()
                 toast("已保存 ${AppSettings.assistantPkgs(this).size} 个包名")
             }
             .setNeutralButton("恢复默认") { _, _ ->
                 AppSettings.setAssistantPkgsRaw(this, "")
+                AssistantBridge.invalidatePkgCache()
                 toast("已恢复默认")
             }
             .setNegativeButton("取消", null)
@@ -2545,11 +2547,13 @@ class MainActivity : AppCompatActivity() {
             .setView(box)
             .setPositiveButton("保存") { _, _ ->
                 AppSettings.setVoiceKeywordsRaw(this, box.text.toString())
+                AppSettings.invalidateKeywordCache()
                 val n = AppSettings.voiceKeywords(this).size
                 toast("已保存 $n 条关键词")
             }
             .setNeutralButton("恢复默认") { _, _ ->
                 AppSettings.setVoiceKeywordsRaw(this, "")
+                AppSettings.invalidateKeywordCache()
                 toast("已恢复默认关键词")
             }
             .setNegativeButton("取消", null)
